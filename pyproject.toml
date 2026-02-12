@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-price"
+version = "0.1.1"
+description = "A simple CLI to track stock prices and dividends"
+dependencies = [
+    "yfinance>=0.2.40",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+    "PyYAML>=6.0.0"
+]
+requires-python = ">=3.10"
+
+[project.scripts]
+stock-price = "stock:fetch_portfolio"
+
+[tool.setuptools]
+py-modules = ["stock"]
