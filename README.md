@@ -1,60 +1,68 @@
 # Stock Price CLI
 
-A clean, terminal-based stock portfolio tracker and dividend calendar. It supports multiple currencies (EUR/SEK) and displays real-time data using `yfinance`.
-
-![Example Output](https://via.placeholder.com/600x400.png?text=Stock+Price+CLI+Output)
+A professional terminal-based portfolio tracker that provides real-time stock prices, daily performance, and an upcoming dividend calendar. It handles multiple currencies (EUR/SEK) automatically.
 
 ## Features
 
-- 📊 **Portfolio Summary**: Live prices, quantities, and daily percentage changes.
-- 💰 **Dividend Calendar**: Upcoming ex-dividend dates and estimated payouts.
-- 💱 **Auto Currency Conversion**: Automatic EUR/SEK conversion for Swedish and International stocks.
-- ⚙️ **YAML Configuration**: Manage your holdings easily in a separate config file.
+- 📊 **Real-time Portfolio Summary**: Tracks price, quantity, and daily % change.
+- 💰 **Dividend Calendar**: Displays the next ex-dividend date and estimated payout amount.
+- 💱 **Multi-Currency Support**: Automatically converts Swedish (SEK) holdings to Euro (EUR) using live exchange rates.
+- ⚙️ **External Configuration**: Uses a simple YAML file in your home directory to manage holdings.
 
 ## Installation
 
-### Using Homebrew (Recommended)
+### 1. Using Homebrew (Recommended)
 
-You can install this directly from GitHub once you've set up your tap:
+You can install the CLI using the `artback/stock-change` tap:
 
 ```bash
-brew tap <your-username>/stock-price
+# Tap the repository
+brew tap artback/stock-change
+
+# Install the tool
 brew install stock-price
 ```
 
-### Manual Installation
+### 2. Manual Installation (Development)
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/jonathan/stock_price.git
-   cd stock_price
-   ```
-2. Install using pip:
-   ```bash
-   pip install .
-   ```
+If you want to run it locally from the source:
+
+```bash
+git clone git@github.com:artback/stock-change.git
+cd stock-change
+python3 -m venv venv
+source venv/bin/activate
+pip install .
+```
 
 ## Configuration
 
-Create a configuration file at `~/.stock_price.yaml` to define your holdings:
+The CLI looks for a configuration file at `~/.stock_price.yaml`. Create this file to define your stock holdings:
 
 ```yaml
 holdings:
-  SVOL-B.ST: 8367
-  INVE-B.ST: 1387
-  MC.PA: 45
-  IUSA.DE: 720
+  AAPL: 10          # US Stock (USD)
+  SVOL-B.ST: 100    # Swedish Stock (Auto-converted to EUR)
+  MC.PA: 5          # French Stock (EUR)
+  IUSA.DE: 50       # German ETF (EUR)
 ```
 
 ## Usage
 
-Simply run:
+Once installed, simply run the command from any terminal:
+
 ```bash
 stock-price
 ```
 
-## Dependencies
+## Homebrew Tap Setup (For Maintainers)
 
-- [yfinance](https://github.com/ranaroussi/yfinance)
-- [rich](https://github.com/Textualize/rich)
-- [PyYAML](https://pyyaml.org/)
+To maintain the Homebrew tap at `artback/stock-change`:
+
+1. Create a GitHub repository named `homebrew-stock-change`.
+2. Place the `stock-price.rb` formula in a `Formula/` directory within that repo.
+3. Update the `url` and `sha256` in the formula whenever a new version is released.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
