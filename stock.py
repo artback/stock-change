@@ -3,12 +3,15 @@ import yfinance as yf
 import logging
 import yaml
 import time
+import argparse
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from datetime import datetime
+
+__version__ = "0.1.5"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -47,6 +50,10 @@ def get_exchange_rate():
     return 0.088
 
 def fetch_portfolio():
+    parser = argparse.ArgumentParser(description="Track stock prices and dividends")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.parse_args()
+
     holdings = load_config()
     sek_to_eur = get_exchange_rate()
 
@@ -71,13 +78,11 @@ def fetch_portfolio():
             t = yf.Ticker(ticker_symbol)
             fi = t.fast_info
             
-            # Direct index access to FastInfo object
             try:
                 price = fi['lastPrice']
                 prev_close = fi['previousClose']
                 currency = fi['currency']
             except (KeyError, TypeError):
-                # Fallback to get() if index fails
                 price = fi.get('lastPrice')
                 prev_close = fi.get('previousClose')
                 currency = fi.get('currency', 'EUR')
@@ -105,13 +110,11 @@ def fetch_portfolio():
                 Text(f"{chg_pct:+.2f}%", style="green" if chg_pct >= 0 else "red")
             )
             
-            # Dividends
             try:
                 cal = t.calendar
                 if cal and 'Ex-Dividend Date' in cal:
                     ex_date = cal['Ex-Dividend Date']
                     if ex_date and ex_date >= datetime.now().date():
-                        # info can be slow, but it's needed for the rate
                         d_info = t.info
                         div_amt = d_info.get('lastDividendValue') or d_info.get('dividendRate') or 0
                         if div_amt > 0:
