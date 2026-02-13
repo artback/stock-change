@@ -12,14 +12,14 @@ Set WindowBar Colorful
 # Setup the environment (hidden)
 Hide
 Type "export PYTHONPATH=$PYTHONPATH:." Enter
-Type "cat <<EOF > demo_config.yaml
-holdings:
-  AAPL: 10
-  SVOL-B.ST: 100
-  MC.PA: 5
-  INDU-C.ST: 21
-currency: EUR
-EOF" Enter
+Type "cat <<EOF > demo_config.yaml" Enter
+Type "holdings:" Enter
+Type "  AAPL: 10" Enter
+Type "  SVOL-B.ST: 100" Enter
+Type "  MC.PA: 5" Enter
+Type "  INDU-C.ST: 21" Enter
+Type "currency: EUR" Enter
+Type "EOF" Enter
 Type "export STOCK_PRICE_CONFIG=demo_config.yaml" Enter
 Type "clear" Enter
 Show
