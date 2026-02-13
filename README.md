@@ -56,14 +56,18 @@ currency: EUR       # Target currency for total value and conversion
 Once installed, simply run the command:
 
 ```bash
-# Standard view
+# Standard view (uses ~/.stock_price.yaml)
+stock-price
+
+# Use a custom configuration file
+stock-price --config ./my_stocks.yaml
+
+# Use an environment variable for configuration
+export STOCK_PRICE_CONFIG="./my_stocks.yaml"
 stock-price
 
 # Live watch mode (updates every 5 seconds)
 stock-price --watch
-
-# Specify a different currency
-stock-price --currency USD
 ```
 
 ## Maintenance

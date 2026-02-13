@@ -45,11 +45,18 @@ CURRENCY_SYMBOLS = {
     "JPY": "¥", "CHF": "Fr", "CAD": "C$", "AUD": "A$"
 }
 
-def load_config():
+def load_config(config_path=None):
     config_data = {"holdings": DEFAULT_HOLDINGS, "currency": "EUR"}
-    if DEFAULT_CONFIG_PATH.exists():
+    
+    # Priority: 1. CLI Arg, 2. Env Var, 3. Default Path
+    resolved_path = Path(config_path) if config_path else None
+    if not resolved_path:
+        env_path = os.environ.get("STOCK_PRICE_CONFIG")
+        resolved_path = Path(env_path) if env_path else DEFAULT_CONFIG_PATH
+
+    if resolved_path.exists():
         try:
-            with open(DEFAULT_CONFIG_PATH, "r") as f:
+            with open(resolved_path, "r") as f:
                 user_config = yaml.safe_load(f)
                 if user_config:
                     if "holdings" in user_config:
@@ -57,7 +64,10 @@ def load_config():
                     if "currency" in user_config:
                         config_data["currency"] = user_config["currency"].upper()
         except Exception as e:
-            console.print(f"[red]Error loading config:[/red] {e}")
+            console.print(f"[red]Error loading config ({resolved_path}):[/red] {e}")
+    elif config_path:
+        console.print(f"[yellow]Warning: Config file not found at {config_path}[/yellow]")
+        
     return config_data
 
 def validate_currency(currency_code):
@@ -182,9 +192,10 @@ def fetch_portfolio():
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-c", "--currency", help="Output currency (e.g. USD, EUR, SEK)")
     parser.add_argument("-w", "--watch", action="store_true", help="Watch mode: update every 5 seconds")
+    parser.add_argument("--config", help="Path to a custom YAML configuration file")
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_config(args.config)
     target_currency = (args.currency or config["currency"]).upper()
     holdings = config["holdings"]
     
