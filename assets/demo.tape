@@ -12,8 +12,7 @@ Set WindowBar Colorful
 # Setup the environment (hidden)
 Hide
 Type "export PYTHONPATH=$PYTHONPATH:." Enter
-Type "mkdir -p ~/.stock_price.yaml" Enter
-Type "cat <<EOF > ~/.stock_price.yaml
+Type "cat <<EOF > demo_config.yaml
 holdings:
   AAPL: 10
   SVOL-B.ST: 100
@@ -21,6 +20,7 @@ holdings:
   INDU-C.ST: 21
 currency: EUR
 EOF" Enter
+Type "export STOCK_PRICE_CONFIG=demo_config.yaml" Enter
 Type "clear" Enter
 Show
 
@@ -31,3 +31,7 @@ Sleep 10s
 # Exit
 Ctrl+C
 Sleep 2s
+
+# Cleanup (hidden)
+Hide
+Type "rm demo_config.yaml" Enter
