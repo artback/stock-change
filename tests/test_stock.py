@@ -27,12 +27,22 @@ def test_build_display_group():
             "qty": 10,
             "val_now": 1500.0,
             "val_prev": 1450.0,
-            "chg_pct": 3.45
+            "chg_pct": 3.45,
+            "source_currency": "USD"
         }
     ]
-    group = build_display_group(summary_results, [], "USD", "Status")
+    history_points = [1400.0, 1420.0, 1450.0, 1500.0]
+    group = build_display_group(summary_results, [], "USD", "Status", history_points)
     # group is a rich.console.Group
     assert len(group.renderables) > 0
+    
+    # Check if history section is in the output (indirectly by checking rendering)
+    from rich.console import Console
+    console = Console()
+    with console.capture() as capture:
+        console.print(group)
+    output = capture.get()
+    assert "30D DEVELOPMENT" in output
 
 def test_validate_currency_mocked(mocker):
     mock_ticker = mocker.Mock()

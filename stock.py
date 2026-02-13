@@ -16,6 +16,7 @@ from rich.live import Live
 from rich.spinner import Spinner
 from rich.console import Group
 from datetime import datetime
+import pandas as pd
 try:
     from importlib.metadata import version
     __version__ = version("stock-price")
@@ -137,7 +138,53 @@ def get_dividend_data(summary_data):
     except: pass
     return None
 
-def build_display_group(summary_results, dividend_results, target_currency, footer_text=""):
+def render_sparkline(values):
+    if not values or len(values) < 2: return ""
+    chars = " ▂▃▄▅▆▇█"
+    min_v, max_v = min(values), max(values)
+    span = max_v - min_v
+    if span <= 0: return "█" * len(values)
+    return "".join(chars[min(int((v - min_v) / span * 7), 7)] for v in values)
+
+def fetch_history(holdings, target_currency, ticker_to_currency):
+    try:
+        symbols = list(holdings.keys())
+        currencies = set(ticker_to_currency.values())
+        rate_pairs = [f"{c}{target_currency}=X" for c in currencies if c != target_currency]
+        
+        all_to_fetch = symbols + rate_pairs
+        df = yf.download(all_to_fetch, period="1mo", interval="1d", progress=False, threads=True)
+        
+        if df.empty: return []
+        
+        close_data = df['Close']
+        if isinstance(close_data, pd.Series):
+            sym = all_to_fetch[0]
+            close_data = pd.DataFrame({sym: close_data})
+            
+        history_totals = []
+        for _, row in close_data.iterrows():
+            daily_total = 0
+            has_data = False
+            for sym, qty in holdings.items():
+                if sym in row and not pd.isna(row[sym]):
+                    src_curr = ticker_to_currency.get(sym, 'USD')
+                    rate = 1.0
+                    if src_curr != target_currency:
+                        r_sym = f"{src_curr}{target_currency}=X"
+                        rate = row[r_sym] if r_sym in row and not pd.isna(row[r_sym]) else 1.0
+                    
+                    daily_total += row[sym] * qty * rate
+                    has_data = True
+            
+            if has_data:
+                history_totals.append(daily_total)
+        
+        return history_totals
+    except Exception:
+        return []
+
+def build_display_group(summary_results, dividend_results, target_currency, footer_text="", history_points=None):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     
     # 1. Summary Table (No expand=True to keep it compact)
@@ -172,10 +219,18 @@ def build_display_group(summary_results, dividend_results, target_currency, foot
     summary_panel = None
     if total_prev > 0:
         day_chg = ((total_val - total_prev) / total_prev) * 100
-        summary_panel = Panel(Text.assemble(
+        summary_text = Text.assemble(
             ("TOTAL VALUE:  ", "white"), (f"{total_val:,.2f} {target_symbol}\n", "bold white"),
             ("DAY CHANGE:   ", "white"), (f"{day_chg:+.2f}%", "bold green" if day_chg >= 0 else "bold red")
-        ), border_style="bright_blue", expand=False)
+        )
+
+        if history_points and len(history_points) > 1:
+            spark = render_sparkline(history_points)
+            summary_text.append("\n\n")
+            summary_text.append("30D DEVELOPMENT:\n", style="dim")
+            summary_text.append(spark, style="bright_cyan")
+
+        summary_panel = Panel(summary_text, border_style="bright_blue", expand=False)
 
     # 4. Footer
     footer = Text(footer_text, style="dim italic") if footer_text else Text("")
@@ -206,6 +261,9 @@ def fetch_portfolio():
 
         last_summary = []
         last_dividends = []
+        history_points = []
+        last_history_update = 0
+        ticker_to_currency = {}
 
         with Live(build_display_group([], [], target_currency, "Initializing..."), 
                   console=console, refresh_per_second=4, transient=True, screen=args.watch) as live:
@@ -224,11 +282,18 @@ def fetch_portfolio():
                         completed += 1
                         if res:
                             current_summary.append(res)
+                            ticker_to_currency[res['symbol']] = res['source_currency']
                         
                         # Only update if data changed or first run to show progress
                         display_summary = current_summary if not last_summary else last_summary
                         live.update(build_display_group(display_summary, last_dividends, target_currency, 
-                                                       f"Updating ({completed}/{num_holdings})..."))
+                                                       f"Updating ({completed}/{num_holdings})...", history_points))
+
+                # Fetch 30D history if needed (every 120s)
+                now = time.time()
+                if ticker_to_currency and (now - last_history_update > 120 or not history_points):
+                    history_points = fetch_history(holdings, target_currency, ticker_to_currency)
+                    last_history_update = now
 
                 if current_summary:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=len(current_summary)) as executor:
@@ -246,7 +311,7 @@ def fetch_portfolio():
                 
                 # Update display with last update time and wait
                 msg = f"Last update: {last_update} | Ctrl+C to exit"
-                live.update(build_display_group(last_summary, last_dividends, target_currency, msg))
+                live.update(build_display_group(last_summary, last_dividends, target_currency, msg, history_points))
                 
                 # Smooth wait loop (5 seconds)
                 for _ in range(50):
