@@ -25,7 +25,7 @@ Type "clear" Enter
 Show
 
 # Start the Demo
-Type "python3 stock.py --watch" Sleep 500ms Enter
+Type "stock-price --watch" Sleep 500ms Enter
 Sleep 10s
 
 # Exit

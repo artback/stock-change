@@ -46,14 +46,9 @@ jobs:
         env:
           PYTHONPATH: .
 
-      - name: Check for changes
-        id: git-check
-        run: |
-          git diff --exit-code assets/demo.gif || echo "changed=true" >> $GITHUB_OUTPUT
-
       - name: Commit and push changes
-        if: steps.git-check.outputs.changed == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore(assets): update demo.gif [skip ci]"
           file_pattern: assets/demo.gif
+          add_options: '--force'
