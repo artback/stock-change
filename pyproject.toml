@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-price"
-version = "0.1.6"
+version = "0.1.7"
 description = "A simple CLI to track stock prices and dividends"
 dependencies = [
     "yfinance>=0.2.40",
