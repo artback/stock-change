@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.text import Text
 from datetime import datetime
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
