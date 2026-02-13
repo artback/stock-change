@@ -16,7 +16,7 @@ from rich.live import Live
 from rich.spinner import Spinner
 from datetime import datetime
 
-__version__ = "0.1.14"
+__version__ = "0.1.15"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -54,7 +54,7 @@ def load_config():
             console.print(f"[red]Error loading config:[/red] {e}")
     return config_data
 
-def validate_currency(currency_code, session):
+def validate_currency(currency_code):
     """Validates the ISO currency code by trying to fetch a USD rate for it."""
     currency_code = currency_code.upper()
     if len(currency_code) != 3:
@@ -63,14 +63,15 @@ def validate_currency(currency_code, session):
         return True
     try:
         # Check if we can get a rate for this currency against USD
-        ticker = yf.Ticker(f"USD{currency_code}=X", session=session)
+        # Removing the custom session to let yfinance handle it
+        ticker = yf.Ticker(f"USD{currency_code}=X")
         if ticker.fast_info.get('lastPrice'):
             return True
     except:
         pass
     return False
 
-def get_rate(source, target, session, cache):
+def get_rate(source, target, cache):
     """Fetches and caches the conversion rate from source to target currency."""
     if source == target:
         return 1.0
@@ -79,7 +80,7 @@ def get_rate(source, target, session, cache):
         return cache[pair]
     
     try:
-        ticker = yf.Ticker(pair, session=session)
+        ticker = yf.Ticker(pair)
         rate = ticker.fast_info['lastPrice']
         cache[pair] = rate
         return rate
@@ -87,23 +88,23 @@ def get_rate(source, target, session, cache):
         # Fallback: Try the inverse if the direct pair fails
         try:
             inverse_pair = f"{target}{source}=X"
-            ticker = yf.Ticker(inverse_pair, session=session)
+            ticker = yf.Ticker(inverse_pair)
             rate = 1 / ticker.fast_info['lastPrice']
             cache[pair] = rate
             return rate
         except:
             return None
 
-def get_ticker_summary(symbol, qty, target_currency, session, rate_cache):
+def get_ticker_summary(symbol, qty, target_currency, rate_cache):
     try:
-        t = yf.Ticker(symbol, session=session)
+        t = yf.Ticker(symbol)
         fi = t.fast_info
         price = fi.get('lastPrice')
         prev_close = fi.get('previousClose')
         source_currency = fi.get('currency', 'USD')
         
-        # Get conversion rate (threaded but uses cache to avoid redundant calls)
-        conv = get_rate(source_currency, target_currency, session, rate_cache)
+        # Get conversion rate
+        conv = get_rate(source_currency, target_currency, rate_cache)
         
         if price is not None and conv is not None:
             val_now = (price * conv) * qty
@@ -169,12 +170,10 @@ def fetch_portfolio():
     target_currency = (args.currency or config["currency"]).upper()
     holdings = config["holdings"]
     
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0'})
     rate_cache = {}
 
     with Live(Spinner("dots", text=f"Validating currency {target_currency}..."), console=console, refresh_per_second=4) as live:
-        if not validate_currency(target_currency, session):
+        if not validate_currency(target_currency):
             live.stop()
             console.print(f"[bold red]ERROR:[/bold red] '{target_currency}' is not a valid ISO currency code.")
             sys.exit(1)
@@ -184,7 +183,7 @@ def fetch_portfolio():
         
         live.update(Spinner("dots", text=f"Fetching prices in {target_currency}..."))
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(holdings)) as executor:
-            futures = [executor.submit(get_ticker_summary, s, q, target_currency, session, rate_cache) for s, q in holdings.items()]
+            futures = [executor.submit(get_ticker_summary, s, q, target_currency, rate_cache) for s, q in holdings.items()]
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()
                 if res:
