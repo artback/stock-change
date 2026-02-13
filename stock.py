@@ -5,6 +5,7 @@ import yaml
 import time
 import argparse
 import concurrent.futures
+import requests
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
@@ -12,10 +13,9 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.live import Live
 from rich.spinner import Spinner
-from rich.layout import Layout
 from datetime import datetime
 
-__version__ = "0.1.12"
+__version__ = "0.1.13"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -43,17 +43,20 @@ def load_config():
             console.print(f"[red]Error loading config:[/red] {e}")
     return DEFAULT_HOLDINGS
 
-def get_exchange_rate():
+def get_exchange_rate(session):
     try:
-        ticker = yf.Ticker("EURSEK=X")
+        ticker = yf.Ticker("EURSEK=X", session=session)
         rate = ticker.fast_info['lastPrice']
         return 1 / rate if rate else 0.088
     except:
         return 0.088
 
-def get_ticker_summary(symbol, qty, sek_to_eur):
+def get_ticker_summary(symbol, qty, sek_to_eur_future, session):
     try:
-        t = yf.Ticker(symbol)
+        # Wait for the exchange rate if it's not ready yet
+        sek_to_eur = sek_to_eur_future.result() if isinstance(sek_to_eur_future, concurrent.futures.Future) else sek_to_eur_future
+        
+        t = yf.Ticker(symbol, session=session)
         fi = t.fast_info
         price = fi.get('lastPrice')
         prev_close = fi.get('previousClose')
@@ -75,21 +78,20 @@ def get_ticker_summary(symbol, qty, sek_to_eur):
 def get_dividend_data(summary_data):
     try:
         t = summary_data['ticker_obj']
-        qty = summary_data['qty']
-        conv = summary_data['conv']
-        currency = summary_data['currency']
-        
+        # Calendar is relatively fast
         cal = t.calendar
         if cal and 'Ex-Dividend Date' in cal:
             ex_date = cal['Ex-Dividend Date']
             if ex_date and ex_date >= datetime.now().date():
+                # We still need info for the dividendRate, but since we already 
+                # have the Ticker object and session, it's as fast as it can be.
                 d_info = t.info
                 div_amt = d_info.get('lastDividendValue') or d_info.get('dividendRate') or 0
                 if div_amt > 0:
                     return {
                         "symbol": summary_data['symbol'], "ex_date": ex_date,
-                        "amt": div_amt, "total_p": (div_amt * conv) * qty,
-                        "cur_symbol": "kr" if currency == "SEK" else "€"
+                        "amt": div_amt, "total_p": (div_amt * summary_data['conv']) * summary_data['qty'],
+                        "cur_symbol": "kr" if summary_data['currency'] == "SEK" else "€"
                     }
     except:
         pass
@@ -122,15 +124,19 @@ def fetch_portfolio():
     summary_results = []
     dividend_results = []
     
-    with Live(Spinner("dots", text="Initializing..."), console=console, refresh_per_second=4) as live:
-        # Step 1: Exchange rate
-        live.update(Spinner("dots", text="Fetching exchange rates..."))
-        sek_to_eur = get_exchange_rate()
-        
-        # Step 2: Fetch Summary Data
-        live.update(Spinner("dots", text="Fetching portfolio prices..."))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(holdings)) as executor:
-            futures = [executor.submit(get_ticker_summary, s, q, sek_to_eur) for s, q in holdings.items()]
+    # Use a persistent session to speed up handshakes
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+
+    with Live(Spinner("dots", text="Fetching data..."), console=console, refresh_per_second=4) as live:
+        # Start ThreadPool for parallel execution
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(holdings) + 1) as executor:
+            # 1. Fetch exchange rate in parallel with stocks
+            sek_to_eur_future = executor.submit(get_exchange_rate, session)
+            
+            # 2. Start Stock fetches immediately
+            futures = [executor.submit(get_ticker_summary, s, q, sek_to_eur_future, session) for s, q in holdings.items()]
+            
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()
                 if res:
@@ -138,22 +144,16 @@ def fetch_portfolio():
                     table, _, _ = generate_table(summary_results)
                     live.update(table)
 
-        # Step 3: Fetch Dividend Data
-        if summary_results:
-            # Show table but indicate dividend fetching is happening
-            main_table, _, _ = generate_table(summary_results)
-            live.update(main_table)
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(summary_results)) as executor:
+            # 3. Parallel fetch dividends once summaries are ready
+            if summary_results:
                 div_futures = [executor.submit(get_dividend_data, s) for s in summary_results]
                 for future in concurrent.futures.as_completed(div_futures):
                     res = future.result()
                     if res:
                         dividend_results.append(res)
         
-        # Final Assembly
+        # UI Assembly
         final_main_table, total_val, total_prev = generate_table(summary_results)
-        
         div_table = None
         if dividend_results:
             div_table = Table(title="Upcoming Dividends", header_style="bold magenta")
@@ -172,10 +172,8 @@ def fetch_portfolio():
                 ("DAY CHANGE:   ", "white"), (f"{day_chg:+.2f}%", "bold green" if day_chg >= 0 else "bold red")
             ), border_style="bright_blue", expand=False)
         
-        # Clear live display before printing final results
         live.update(Text(""))
 
-    # Final persistent print
     console.print(final_main_table)
     if div_table: console.print(div_table)
     if summary_panel: console.print(summary_panel)
