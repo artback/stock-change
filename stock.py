@@ -177,19 +177,19 @@ def get_dividend_data(summary_data):
 def render_sparkline(values):
 
 
-    if not values or len(values) < 2: return ""
+    if not values or len(values) < 2:
 
 
-    # Use dots at different heights to simulate a line
+        return ""
 
 
-    # Dots 4 (bottom), 2 (middle), 1 (top) in Braille
 
 
-    # ⡀ (dot 7-8-ish) ⠄ (dot 3) ⠂ (dot 2) ⠁ (dot 1)
+
+    # Use horizontal segments at different heights for a clean, bold line
 
 
-    chars = ["⡀", "⠄", "⠂", "⠁"]
+    chars = ["⎽", "⎼", "⎻", "⎺"]
 
 
     
@@ -201,13 +201,22 @@ def render_sparkline(values):
     span = max_v - min_v
 
 
-    if span <= 0: return "⠒" * len(values)
+    if span <= 0:
+
+
+        return "─" * len(values)
 
 
     
 
 
-    return "".join(chars[3 - min(int((v - min_v) / span * 3), 3)] for v in values)
+    return "".join(chars[min(int((v - min_v) / span * 3), 3)] for v in values)
+
+
+
+
+
+
 
 
 
