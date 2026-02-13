@@ -175,14 +175,45 @@ def get_dividend_data(summary_data):
 
 
 def render_sparkline(values):
-    if not values or len(values) < 2:
-        return ""
-    chars = " ▂▃▄▅▆▇█"
+
+
+    if not values or len(values) < 2: return ""
+
+
+    # Use dots at different heights to simulate a line
+
+
+    # Dots 4 (bottom), 2 (middle), 1 (top) in Braille
+
+
+    # ⡀ (dot 7-8-ish) ⠄ (dot 3) ⠂ (dot 2) ⠁ (dot 1)
+
+
+    chars = ["⡀", "⠄", "⠂", "⠁"]
+
+
+    
+
+
     min_v, max_v = min(values), max(values)
+
+
     span = max_v - min_v
-    if span <= 0:
-        return "█" * len(values)
-    return "".join(chars[min(int((v - min_v) / span * 7), 7)] for v in values)
+
+
+    if span <= 0: return "⠒" * len(values)
+
+
+    
+
+
+    return "".join(chars[3 - min(int((v - min_v) / span * 3), 3)] for v in values)
+
+
+
+
+
+
 
 
 def fetch_history(holdings, target_currency, ticker_to_currency):
