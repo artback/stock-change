@@ -2,10 +2,10 @@
 Output assets/demo.gif
 
 # Settings
-Set FontSize 20
+Set FontSize 16
 Set Width 1200
-Set Height 600
-Set Padding 40
+Set Height 700
+Set Padding 30
 Set FontFamily "DejaVu Sans Mono"
 Set WindowBar Colorful
 
