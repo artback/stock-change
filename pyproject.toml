@@ -16,6 +16,14 @@ dependencies = [
 ]
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+dev = [
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+    "pytest-cov>=4.1.0",
+    "pre-commit>=3.6.0"
+]
+
 [project.scripts]
 stock-price = "stock:fetch_portfolio"
 
