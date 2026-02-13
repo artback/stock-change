@@ -1,0 +1,59 @@
+name: Update Demo GIF
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'assets/demo.tape'
+      - 'stock.py'
+      - 'VERSION'
+
+permissions:
+  contents: write
+
+jobs:
+  update-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install .
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu fontconfig
+          fc-cache -f -v
+          wget -q -O ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.3/ttyd.x86_64
+          sudo mv ttyd /usr/local/bin/ttyd
+          sudo chmod +x /usr/local/bin/ttyd
+
+      - name: Install VHS
+        run: |
+          # Use go to install vhs as per example
+          sudo apt-get install -y golang
+          go install github.com/charmbracelet/vhs@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run VHS
+        run: vhs assets/demo.tape
+        env:
+          PYTHONPATH: .
+
+      - name: Check for changes
+        id: git-check
+        run: |
+          git diff --exit-code assets/demo.gif || echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Commit and push changes
+        if: steps.git-check.outputs.changed == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(assets): update demo.gif [skip ci]"
+          file_pattern: assets/demo.gif

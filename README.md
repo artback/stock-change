@@ -1,13 +1,17 @@
 # Stock Price CLI
 
-A professional terminal-based portfolio tracker that provides real-time stock prices, daily performance, and an upcoming dividend calendar. It handles multiple currencies (EUR/SEK) automatically.
+A professional terminal-based portfolio tracker that provides real-time stock prices, daily performance, and an upcoming dividend calendar. It handles multiple currencies automatically and features a smooth, live-updating interface.
+
+![Demo](assets/demo.gif)
 
 ## Features
 
-- 📊 **Real-time Portfolio Summary**: Tracks price, quantity, and daily % change.
-- 💰 **Dividend Calendar**: Displays the next ex-dividend date and estimated payout amount.
-- 💱 **Multi-Currency Support**: Automatically converts Swedish (SEK) holdings to Euro (EUR) using live exchange rates.
-- ⚙️ **External Configuration**: Uses a simple YAML file in your home directory to manage holdings.
+- 📊 **Real-time Portfolio Summary**: Tracks price, quantity, and daily % change with a clean, formatted table.
+- 💰 **Dividend Calendar**: Displays upcoming ex-dividend dates and estimated payout amounts.
+- 💱 **Multi-Currency Support**: Automatically converts holdings to your target currency (USD, EUR, SEK, etc.) using live exchange rates.
+- ⌚ **Watch Mode**: Update your portfolio in real-time with the `--watch` flag.
+- ⚙️ **External Configuration**: Managed via a simple YAML file in your home directory.
+- 🚀 **Automatic Updates**: Centralized versioning and automated Homebrew releases.
 
 ## Installation
 
@@ -37,31 +41,39 @@ pip install .
 
 ## Configuration
 
-The CLI looks for a configuration file at `~/.stock_price.yaml`. Create this file to define your stock holdings:
+The CLI looks for a configuration file at `~/.stock_price.yaml`. Create this file to define your stock holdings and preferred currency:
 
 ```yaml
 holdings:
-  AAPL: 10          # US Stock (USD)
-  SVOL-B.ST: 100    # Swedish Stock (Auto-converted to EUR)
-  MC.PA: 5          # French Stock (EUR)
-  IUSA.DE: 50       # German ETF (EUR)
+  SVOL-B.ST: 8367   # Swedish Stock
+  AAPL: 10          # US Stock
+  MC.PA: 45         # French Stock
+currency: EUR       # Target currency for total value and conversion
 ```
 
 ## Usage
 
-Once installed, simply run the command from any terminal:
+Once installed, simply run the command:
 
 ```bash
+# Standard view
 stock-price
+
+# Live watch mode (updates every 5 seconds)
+stock-price --watch
+
+# Specify a different currency
+stock-price --currency USD
 ```
 
-## Homebrew Tap Setup (For Maintainers)
+## Maintenance
 
-To maintain the Homebrew tap at `artback/stock-change`:
-
-1. Create a GitHub repository named `homebrew-stock-change`.
-2. Place the `stock-price.rb` formula in a `Formula/` directory within that repo.
-3. Update the `url` and `sha256` in the formula whenever a new version is released.
+This project uses an automated release workflow:
+1. Update the version in the `VERSION` file.
+2. Push to `main`.
+3. GitHub Actions will automatically:
+    - Update the Homebrew formula in `artback/homebrew-stock-change`.
+    - Regenerate the `demo.gif` using VHS.
 
 ## License
 
