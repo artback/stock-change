@@ -12,9 +12,10 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.live import Live
 from rich.spinner import Spinner
+from rich.layout import Layout
 from datetime import datetime
 
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -51,7 +52,6 @@ def get_exchange_rate():
         return 0.088
 
 def get_ticker_summary(symbol, qty, sek_to_eur):
-    """Fetches just the price data for the summary table."""
     try:
         t = yf.Ticker(symbol)
         fi = t.fast_info
@@ -73,7 +73,6 @@ def get_ticker_summary(symbol, qty, sek_to_eur):
     return None
 
 def get_dividend_data(summary_data):
-    """Fetches dividend data using an existing Ticker object."""
     try:
         t = summary_data['ticker_obj']
         qty = summary_data['qty']
@@ -123,13 +122,12 @@ def fetch_portfolio():
     summary_results = []
     dividend_results = []
     
-    # Use Live display for real-time updates
     with Live(Spinner("dots", text="Initializing..."), console=console, refresh_per_second=4) as live:
         # Step 1: Exchange rate
         live.update(Spinner("dots", text="Fetching exchange rates..."))
         sek_to_eur = get_exchange_rate()
         
-        # Step 2: Fetch Summary Data in parallel
+        # Step 2: Fetch Summary Data
         live.update(Spinner("dots", text="Fetching portfolio prices..."))
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(holdings)) as executor:
             futures = [executor.submit(get_ticker_summary, s, q, sek_to_eur) for s, q in holdings.items()]
@@ -137,13 +135,15 @@ def fetch_portfolio():
                 res = future.result()
                 if res:
                     summary_results.append(res)
-                    # Update the live display as each row comes in
                     table, _, _ = generate_table(summary_results)
                     live.update(table)
 
-        # Step 3: Fetch Dividend Data in parallel using existing Ticker objects
+        # Step 3: Fetch Dividend Data
         if summary_results:
-            live.update(Panel(generate_table(summary_results)[0], subtitle="Fetching dividends...", subtitle_align="right", border_style="cyan"))
+            # Show table but indicate dividend fetching is happening
+            main_table, _, _ = generate_table(summary_results)
+            live.update(main_table)
+            
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(summary_results)) as executor:
                 div_futures = [executor.submit(get_dividend_data, s) for s in summary_results]
                 for future in concurrent.futures.as_completed(div_futures):
@@ -152,7 +152,7 @@ def fetch_portfolio():
                         dividend_results.append(res)
         
         # Final Assembly
-        main_table, total_val, total_prev = generate_table(summary_results)
+        final_main_table, total_val, total_prev = generate_table(summary_results)
         
         div_table = None
         if dividend_results:
@@ -171,14 +171,12 @@ def fetch_portfolio():
                 ("TOTAL VALUE:  ", "white"), (f"{total_val:,.2f} €\n", "bold white"),
                 ("DAY CHANGE:   ", "white"), (f"{day_chg:+.2f}%", "bold green" if day_chg >= 0 else "bold red")
             ), border_style="bright_blue", expand=False)
-
-        # Update live display with final layout
-        layout = Layout()
-        layout.split_column(Layout(name="main"), Layout(name="div"), Layout(name="sum"))
-        live.update(main_table) # Show final main table
         
-    # After Live ends, print the final tables normally so they stay in terminal scrollback
-    console.print(main_table)
+        # Clear live display before printing final results
+        live.update(Text(""))
+
+    # Final persistent print
+    console.print(final_main_table)
     if div_table: console.print(div_table)
     if summary_panel: console.print(summary_panel)
 
