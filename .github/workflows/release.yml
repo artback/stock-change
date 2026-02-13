@@ -7,16 +7,39 @@ on:
     paths:
       - 'VERSION'
 
+permissions:
+  contents: write
+
 jobs:
-  update-homebrew:
+  create-release:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.VERSION }}
     steps:
       - name: Checkout stock-price
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get Version
         id: get_version
         run: echo "VERSION=$(cat VERSION | xargs)" >> $GITHUB_OUTPUT
+
+      - name: Create Tag and Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          git tag v$VERSION
+          git push origin v$VERSION
+          gh release create v$VERSION --title "v$VERSION" --generate-notes
+
+  update-homebrew:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout stock-price
+        uses: actions/checkout@v4
 
       - name: Checkout homebrew-stock-change
         uses: actions/checkout@v4
@@ -27,9 +50,9 @@ jobs:
 
       - name: Update Homebrew Formula
         run: |
-          NEW_VERSION=${{ steps.get_version.outputs.VERSION }}
+          NEW_VERSION=${{ needs.create-release.outputs.version }}
           FORMULA_PATH="homebrew-tap/Formula/stock-price.rb"
-          sed -i "s/version ".*"/version "$NEW_VERSION"/" $FORMULA_PATH
+          sed -i "s/version \".*\"/version \"$NEW_VERSION\"/" $FORMULA_PATH
           
           cd homebrew-tap
           git config user.name "github-actions[bot]"
