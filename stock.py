@@ -17,7 +17,7 @@ from rich.spinner import Spinner
 from rich.console import Group
 from datetime import datetime
 
-__version__ = "0.1.18"
+__version__ = "0.1.19"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -121,15 +121,15 @@ def get_dividend_data(summary_data):
     except: pass
     return None
 
-def build_display_group(summary_results, dividend_results, target_currency, status_msg=""):
+def build_display_group(summary_results, dividend_results, target_currency, footer_text=""):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     
-    # 1. Summary Table
-    table = Table(title=f"Portfolio Summary ({target_currency})", header_style="bold cyan", expand=True)
-    table.add_column("Ticker")
-    table.add_column("Quantity", justify="right")
-    table.add_column(f"Value ({target_symbol})", justify="right", style="bold white")
-    table.add_column("Day %", justify="right")
+    # 1. Summary Table (No expand=True to keep it compact)
+    table = Table(title=f"Portfolio Summary ({target_currency})", header_style="bold cyan")
+    table.add_column("Ticker", width=12)
+    table.add_column("Quantity", justify="right", width=10)
+    table.add_column(f"Value ({target_symbol})", justify="right", style="bold white", width=15)
+    table.add_column("Day %", justify="right", width=10)
     
     total_val = 0
     total_prev = 0
@@ -144,11 +144,11 @@ def build_display_group(summary_results, dividend_results, target_currency, stat
     # 2. Dividends Table
     div_table = None
     if dividend_results:
-        div_table = Table(title="Upcoming Dividends", header_style="bold magenta", expand=True)
-        div_table.add_column("Ticker")
-        div_table.add_column("Ex-Date", justify="center")
-        div_table.add_column("Amount", justify="right")
-        div_table.add_column(f"Total ({target_symbol})", justify="right", style="green")
+        div_table = Table(title="Upcoming Dividends", header_style="bold magenta")
+        div_table.add_column("Ticker", width=12)
+        div_table.add_column("Ex-Date", justify="center", width=12)
+        div_table.add_column("Amount", justify="right", width=12)
+        div_table.add_column(f"Total ({target_symbol})", justify="right", style="green", width=15)
         for d in sorted(dividend_results, key=lambda x: x['ex_date']):
             div_table.add_row(d['symbol'], str(d['ex_date']), f"{d['amt']:.2f} {d['cur_label']}", f"{d['total_p']:,.2f} {target_symbol}")
 
@@ -159,10 +159,10 @@ def build_display_group(summary_results, dividend_results, target_currency, stat
         summary_panel = Panel(Text.assemble(
             ("TOTAL VALUE:  ", "white"), (f"{total_val:,.2f} {target_symbol}\n", "bold white"),
             ("DAY CHANGE:   ", "white"), (f"{day_chg:+.2f}%", "bold green" if day_chg >= 0 else "bold red")
-        ), border_style="bright_blue", expand=True)
+        ), border_style="bright_blue", expand=False)
 
     # 4. Footer
-    footer = Text(status_msg, style="dim italic") if status_msg else Text("")
+    footer = Text(footer_text, style="dim italic") if footer_text else Text("")
     
     elements = [table]
     if div_table: elements.append(div_table)
@@ -183,13 +183,12 @@ def fetch_portfolio():
     holdings = config["holdings"]
     
     try:
-        # Initial validation outside Live to keep it clean
         if not validate_currency(target_currency):
             console.print(f"[bold red]ERROR:[/bold red] '{target_currency}' is not a valid ISO currency code.")
             sys.exit(1)
 
-        summary_results = []
-        dividend_results = []
+        last_summary = []
+        last_dividends = []
 
         with Live(build_display_group([], [], target_currency, "Initializing..."), console=console, refresh_per_second=4, transient=True) as live:
             while True:
@@ -197,40 +196,39 @@ def fetch_portfolio():
                 current_dividends = []
                 rate_cache = {}
                 
-                # Update prices
+                # Fetch data
                 with concurrent.futures.ThreadPoolExecutor(max_workers=len(holdings)) as executor:
                     futures = [executor.submit(get_ticker_summary, s, q, target_currency, rate_cache) for s, q in holdings.items()]
                     for future in concurrent.futures.as_completed(futures):
                         res = future.result()
                         if res:
                             current_summary.append(res)
-                            live.update(build_display_group(current_summary, current_dividends, target_currency, "Updating prices..."))
+                            # Update live display partially
+                            live.update(build_display_group(current_summary if not last_summary else last_summary, 
+                                                           last_dividends, target_currency, "Updating..."))
 
-                # Update dividends (using existing ticker objects from summary)
                 if current_summary:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=len(current_summary)) as executor:
                         div_futures = [executor.submit(get_dividend_data, s) for s in current_summary]
                         for future in concurrent.futures.as_completed(div_futures):
                             res = future.result()
-                            if res: 
-                                current_dividends.append(res)
-                                live.update(build_display_group(current_summary, current_dividends, target_currency, "Updating dividends..."))
+                            if res: current_dividends.append(res)
                 
-                # Update "persistent" results for this loop
-                summary_results, dividend_results = current_summary, current_dividends
+                # Update persistent results
+                last_summary, last_dividends = current_summary, current_dividends
+                last_update = datetime.now().strftime("%H:%M:%S")
                 
                 if not args.watch:
                     break
                 
-                # Wait loop for watch mode
-                for i in range(5, 0, -1):
-                    msg = f"Next refresh in {i}s... (Ctrl+C to exit)"
-                    live.update(build_display_group(summary_results, dividend_results, target_currency, msg))
-                    time.sleep(1)
+                # Smooth wait loop
+                for _ in range(50): # 5 seconds at 0.1s steps
+                    msg = f"Last update: {last_update} | Ctrl+C to exit"
+                    live.update(build_display_group(last_summary, last_dividends, target_currency, msg))
+                    time.sleep(0.1)
 
-        # Final print after Live context (to keep it in history)
         if not args.watch:
-            console.print(build_display_group(summary_results, dividend_results, target_currency))
+            console.print(build_display_group(last_summary, last_dividends, target_currency))
                 
     except KeyboardInterrupt:
         console.print("\n[yellow]Watch mode stopped.[/yellow]")
