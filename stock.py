@@ -16,7 +16,7 @@ from rich.live import Live
 from rich.spinner import Spinner
 from datetime import datetime
 
-__version__ = "0.1.16"
+__version__ = "0.1.17"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
