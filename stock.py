@@ -16,7 +16,7 @@ from rich.live import Live
 from rich.spinner import Spinner
 from datetime import datetime
 
-__version__ = "0.1.15"
+__version__ = "0.1.16"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -33,7 +33,6 @@ DEFAULT_HOLDINGS = {
     "IUSA.DE": 720
 }
 
-# Simple mapping for common currency symbols
 CURRENCY_SYMBOLS = {
     "EUR": "€", "USD": "$", "GBP": "£", "SEK": "kr", 
     "JPY": "¥", "CHF": "Fr", "CAD": "C$", "AUD": "A$"
@@ -55,15 +54,12 @@ def load_config():
     return config_data
 
 def validate_currency(currency_code):
-    """Validates the ISO currency code by trying to fetch a USD rate for it."""
     currency_code = currency_code.upper()
     if len(currency_code) != 3:
         return False
     if currency_code == "USD":
         return True
     try:
-        # Check if we can get a rate for this currency against USD
-        # Removing the custom session to let yfinance handle it
         ticker = yf.Ticker(f"USD{currency_code}=X")
         if ticker.fast_info.get('lastPrice'):
             return True
@@ -72,20 +68,17 @@ def validate_currency(currency_code):
     return False
 
 def get_rate(source, target, cache):
-    """Fetches and caches the conversion rate from source to target currency."""
     if source == target:
         return 1.0
     pair = f"{source}{target}=X"
     if pair in cache:
         return cache[pair]
-    
     try:
         ticker = yf.Ticker(pair)
         rate = ticker.fast_info['lastPrice']
         cache[pair] = rate
         return rate
     except:
-        # Fallback: Try the inverse if the direct pair fails
         try:
             inverse_pair = f"{target}{source}=X"
             ticker = yf.Ticker(inverse_pair)
@@ -102,8 +95,6 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
         price = fi.get('lastPrice')
         prev_close = fi.get('previousClose')
         source_currency = fi.get('currency', 'USD')
-        
-        # Get conversion rate
         conv = get_rate(source_currency, target_currency, rate_cache)
         
         if price is not None and conv is not None:
@@ -119,12 +110,11 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
         pass
     return None
 
-def get_dividend_data(summary_data, target_currency):
+def get_dividend_data(summary_data):
     try:
         t = summary_data['ticker_obj']
         conv = summary_data['conv']
         source_currency = summary_data['source_currency']
-        
         cal = t.calendar
         if cal and 'Ex-Dividend Date' in cal:
             ex_date = cal['Ex-Dividend Date']
@@ -164,67 +154,88 @@ def fetch_portfolio():
     parser = argparse.ArgumentParser(description="Track stock prices and dividends")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-c", "--currency", help="Output currency (e.g. USD, EUR, SEK)")
+    parser.add_argument("-w", "--watch", action="store_true", help="Watch mode: update every 5 seconds")
     args = parser.parse_args()
 
     config = load_config()
     target_currency = (args.currency or config["currency"]).upper()
     holdings = config["holdings"]
     
-    rate_cache = {}
+    try:
+        with Live(Spinner("dots", text=f"Validating currency {target_currency}..."), console=console, refresh_per_second=4, transient=not args.watch) as live:
+            if not validate_currency(target_currency):
+                live.stop()
+                console.print(f"[bold red]ERROR:[/bold red] '{target_currency}' is not a valid ISO currency code.")
+                sys.exit(1)
 
-    with Live(Spinner("dots", text=f"Validating currency {target_currency}..."), console=console, refresh_per_second=4) as live:
-        if not validate_currency(target_currency):
-            live.stop()
-            console.print(f"[bold red]ERROR:[/bold red] '{target_currency}' is not a valid ISO currency code.")
-            sys.exit(1)
+            while True:
+                summary_results = []
+                dividend_results = []
+                rate_cache = {}
+                
+                live.update(Spinner("dots", text=f"Fetching prices in {target_currency}..."))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(holdings)) as executor:
+                    futures = [executor.submit(get_ticker_summary, s, q, target_currency, rate_cache) for s, q in holdings.items()]
+                    for future in concurrent.futures.as_completed(futures):
+                        res = future.result()
+                        if res:
+                            summary_results.append(res)
+                            table, _, _ = generate_table(summary_results, target_currency)
+                            live.update(table)
 
-        summary_results = []
-        dividend_results = []
-        
-        live.update(Spinner("dots", text=f"Fetching prices in {target_currency}..."))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(holdings)) as executor:
-            futures = [executor.submit(get_ticker_summary, s, q, target_currency, rate_cache) for s, q in holdings.items()]
-            for future in concurrent.futures.as_completed(futures):
-                res = future.result()
-                if res:
-                    summary_results.append(res)
-                    table, _, _ = generate_table(summary_results, target_currency)
-                    live.update(table)
+                if summary_results:
+                    # Update summary table immediately
+                    live.update(generate_table(summary_results, target_currency)[0])
+                    # Fetch dividends in parallel
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(summary_results)) as executor:
+                        div_futures = [executor.submit(get_dividend_data, s) for s in summary_results]
+                        for future in concurrent.futures.as_completed(div_futures):
+                            res = future.result()
+                            if res: dividend_results.append(res)
+                
+                # Build final output layout
+                main_table, total_val, total_prev = generate_table(summary_results, target_currency)
+                target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
+                
+                div_table = None
+                if dividend_results:
+                    div_table = Table(title="Upcoming Dividends", header_style="bold magenta")
+                    div_table.add_column("Ticker")
+                    div_table.add_column("Ex-Date", justify="center")
+                    div_table.add_column("Amount", justify="right")
+                    div_table.add_column(f"Total ({target_symbol})", justify="right", style="green")
+                    for d in sorted(dividend_results, key=lambda x: x['ex_date']):
+                        div_table.add_row(d['symbol'], str(d['ex_date']), f"{d['amt']:.2f} {d['cur_label']}", f"{d['total_p']:,.2f} {target_symbol}")
 
-        if summary_results:
-            live.update(generate_table(summary_results, target_currency)[0])
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(summary_results)) as executor:
-                div_futures = [executor.submit(get_dividend_data, s, target_currency) for s in summary_results]
-                for future in concurrent.futures.as_completed(div_futures):
-                    res = future.result()
-                    if res: dividend_results.append(res)
-        
-        final_main_table, total_val, total_prev = generate_table(summary_results, target_currency)
-        target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
-        
-        div_table = None
-        if dividend_results:
-            div_table = Table(title="Upcoming Dividends", header_style="bold magenta")
-            div_table.add_column("Ticker")
-            div_table.add_column("Ex-Date", justify="center")
-            div_table.add_column("Amount", justify="right")
-            div_table.add_column(f"Total ({target_symbol})", justify="right", style="green")
-            for d in sorted(dividend_results, key=lambda x: x['ex_date']):
-                div_table.add_row(d['symbol'], str(d['ex_date']), f"{d['amt']:.2f} {d['cur_label']}", f"{d['total_p']:,.2f} {target_symbol}")
-
-        summary_panel = None
-        if total_prev > 0:
-            day_chg = ((total_val - total_prev) / total_prev) * 100
-            summary_panel = Panel(Text.assemble(
-                ("TOTAL VALUE:  ", "white"), (f"{total_val:,.2f} {target_symbol}\n", "bold white"),
-                ("DAY CHANGE:   ", "white"), (f"{day_chg:+.2f}%", "bold green" if day_chg >= 0 else "bold red")
-            ), border_style="bright_blue", expand=False)
-        
-        live.update(Text(""))
-
-    console.print(final_main_table)
-    if div_table: console.print(div_table)
-    if summary_panel: console.print(summary_panel)
+                summary_panel = None
+                if total_prev > 0:
+                    day_chg = ((total_val - total_prev) / total_prev) * 100
+                    summary_panel = Panel(Text.assemble(
+                        ("TOTAL VALUE:  ", "white"), (f"{total_val:,.2f} {target_symbol}\n", "bold white"),
+                        ("DAY CHANGE:   ", "white"), (f"{day_chg:+.2f}%", "bold green" if day_chg >= 0 else "bold red")
+                    ), border_style="bright_blue", expand=False)
+                
+                # Combine all elements
+                final_output = Table.grid()
+                final_output.add_row(main_table)
+                if div_table: final_output.add_row(div_table)
+                if summary_panel: final_output.add_row(summary_panel)
+                
+                if not args.watch:
+                    live.update(final_output)
+                    break
+                
+                # Watch mode wait loop
+                for i in range(5, 0, -1):
+                    live.update(Panel(final_output, subtitle=f"Refreshing in {i}s...", subtitle_align="right", border_style="bright_blue"))
+                    time.sleep(1)
+            
+            # If not watch, print one last time after Live context closes
+            if not args.watch:
+                console.print(final_output)
+                
+    except KeyboardInterrupt:
+        sys.exit(0)
 
 if __name__ == "__main__":
     fetch_portfolio()
