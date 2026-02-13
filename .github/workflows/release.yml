@@ -1,0 +1,39 @@
+name: Release and Update Homebrew
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'VERSION'
+
+jobs:
+  update-homebrew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout stock-price
+        uses: actions/checkout@v4
+
+      - name: Get Version
+        id: get_version
+        run: echo "VERSION=$(cat VERSION | xargs)" >> $GITHUB_OUTPUT
+
+      - name: Checkout homebrew-stock-change
+        uses: actions/checkout@v4
+        with:
+          repository: artback/homebrew-stock-change
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Homebrew Formula
+        run: |
+          NEW_VERSION=${{ steps.get_version.outputs.VERSION }}
+          FORMULA_PATH="homebrew-tap/Formula/stock-price.rb"
+          sed -i "s/version ".*"/version "$NEW_VERSION"/" $FORMULA_PATH
+          
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Update stock-price to $NEW_VERSION"
+          git push

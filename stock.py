@@ -16,8 +16,14 @@ from rich.live import Live
 from rich.spinner import Spinner
 from rich.console import Group
 from datetime import datetime
-
-__version__ = "0.1.20"
+try:
+    from importlib.metadata import version
+    __version__ = version("stock-price")
+except Exception:
+    try:
+        __version__ = Path(__file__).parent.joinpath("VERSION").read_text().strip()
+    except Exception:
+        __version__ = "unknown"
 
 # Suppress yfinance logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
