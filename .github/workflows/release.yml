@@ -30,10 +30,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.get_version.outputs.VERSION }}
         run: |
-          git tag v$VERSION
-          git push origin v$VERSION
-          gh release create v$VERSION --title "v$VERSION" --generate-notes
-
+          # Create or move the tag locally (-f is for force)
+          git tag -f v$VERSION
+          # Force push the tag to the remote (-f)
+          git push origin v$VERSION -f
+          # Create the release. 
+          # Use --clobber to overwrite an existing release with the same tag.
+          gh release create v$VERSION --title "v$VERSION" --generate-notes --clobber
   update-homebrew:
     needs: create-release
     runs-on: ubuntu-latest
