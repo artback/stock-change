@@ -35,8 +35,7 @@ jobs:
           # Force push the tag to the remote (-f)
           git push origin v$VERSION -f
           # Create the release. 
-          # Use --clobber to overwrite an existing release with the same tag.
-          gh release create v$VERSION --title "v$VERSION" --generate-notes --clobber
+          gh release create v$VERSION --title "v$VERSION" --generate-notes 
   update-homebrew:
     needs: create-release
     runs-on: ubuntu-latest
