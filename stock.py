@@ -131,12 +131,14 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
             val_now = (price * conv) * qty
             val_prev = (prev_close * conv) * qty if prev_close else val_now
             chg_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0
+            daily_chg_val = val_now - val_prev
             return {
                 "symbol": symbol,
                 "qty": qty,
                 "val_now": val_now,
                 "val_prev": val_prev,
                 "chg_pct": chg_pct,
+                "daily_chg_val": daily_chg_val,
                 "ticker_obj": t,
                 "conv": conv,
                 "source_currency": source_currency,
@@ -239,12 +241,24 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
         )
 
         if df.empty:
-            return []
+            return [], {}
 
         close_data = df["Close"]
         if isinstance(close_data, pd.Series):
             sym = all_to_fetch[0]
             close_data = pd.DataFrame({sym: close_data})
+
+        # Calculate monthly change for each ticker
+        monthly_changes = {}
+        for sym in symbols:
+            if sym in close_data.columns:
+                series = close_data[sym].dropna()
+                if len(series) >= 2:
+                    start_price = series.iloc[0]
+                    end_price = series.iloc[-1]
+                    monthly_changes[sym] = (
+                        (end_price - start_price) / start_price
+                    ) * 100
 
         history_totals = []
         for _, row in close_data.iterrows():
@@ -268,9 +282,9 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
             if has_data:
                 history_totals.append(daily_total)
 
-        return history_totals
+        return history_totals, monthly_changes
     except Exception:
-        return []
+        return [], {}
 
 
 def build_display_group(
@@ -279,8 +293,10 @@ def build_display_group(
     target_currency,
     footer_text="",
     history_points=None,
+    monthly_changes=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
+    monthly_changes = monthly_changes or {}
 
     # 1. Summary Table (No expand=True to keep it compact)
     table = Table(
@@ -295,20 +311,35 @@ def build_display_group(
         width=15,
         no_wrap=True,
     )
+    table.add_column(f"Daily ({target_symbol})", justify="right", width=12, no_wrap=True)
     table.add_column("Day %", justify="right", width=10, no_wrap=True)
+    table.add_column("Month %", justify="right", width=10, no_wrap=True)
 
     total_val = 0
     total_prev = 0
     for s in sorted(summary_results, key=lambda x: x["symbol"]):
         total_val += s["val_now"]
         total_prev += s["val_prev"]
+        
+        m_chg = monthly_changes.get(s["symbol"])
+        m_text = (
+            Text(f"{m_chg:+.2f}%", style="green" if m_chg >= 0 else "red")
+            if m_chg is not None
+            else Text("-", style="dim")
+        )
+
         table.add_row(
             s["symbol"],
             f"{s['qty']:,}",
             f"{s['val_now']:,.2f} {target_symbol}",
             Text(
+                f"{s['daily_chg_val']:+,.2f} {target_symbol}",
+                style="green" if s["daily_chg_val"] >= 0 else "red",
+            ),
+            Text(
                 f"{s['chg_pct']:+.2f}%", style="green" if s["chg_pct"] >= 0 else "red"
             ),
+            m_text,
         )
 
     # 2. Dividends Table
@@ -336,12 +367,20 @@ def build_display_group(
     # 3. Summary Panel
     summary_panel = None
     if total_prev > 0:
-        day_chg = ((total_val - total_prev) / total_prev) * 100
+        day_chg_pct = ((total_val - total_prev) / total_prev) * 100
+        day_chg_val = total_val - total_prev
         summary_text = Text.assemble(
             ("TOTAL VALUE:  ", "white"),
             (f"{total_val:,.2f} {target_symbol}\n", "bold white"),
             ("DAY CHANGE:   ", "white"),
-            (f"{day_chg:+.2f}%", "bold green" if day_chg >= 0 else "bold red"),
+            (
+                f"{day_chg_val:+,.2f} {target_symbol} ",
+                "bold green" if day_chg_val >= 0 else "bold red",
+            ),
+            (
+                f"({day_chg_pct:+.2f}%)",
+                "bold green" if day_chg_pct >= 0 else "bold red",
+            ),
         )
 
         if history_points and len(history_points) > 1:
@@ -391,6 +430,7 @@ def fetch_portfolio():
         last_summary = []
         last_dividends = []
         history_points = []
+        monthly_changes = {}
         last_history_update = 0
         ticker_to_currency = {}
 
@@ -436,6 +476,7 @@ def fetch_portfolio():
                                 target_currency,
                                 f"Updating ({completed}/{num_holdings})...",
                                 history_points,
+                                monthly_changes,
                             )
                         )
 
@@ -444,7 +485,7 @@ def fetch_portfolio():
                 if ticker_to_currency and (
                     now - last_history_update > 120 or not history_points
                 ):
-                    history_points = fetch_history(
+                    history_points, monthly_changes = fetch_history(
                         holdings, target_currency, ticker_to_currency
                     )
                     last_history_update = now
@@ -478,6 +519,7 @@ def fetch_portfolio():
                         target_currency,
                         msg,
                         history_points,
+                        monthly_changes,
                     )
                 )
 
@@ -487,7 +529,14 @@ def fetch_portfolio():
 
         if not args.watch:
             console.print(
-                build_display_group(last_summary, last_dividends, target_currency)
+                build_display_group(
+                    last_summary,
+                    last_dividends,
+                    target_currency,
+                    "",
+                    history_points,
+                    monthly_changes,
+                )
             )
 
     except KeyboardInterrupt:

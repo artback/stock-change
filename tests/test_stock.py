@@ -32,6 +32,7 @@ def test_build_display_group():
             "val_now": 1500.0,
             "val_prev": 1450.0,
             "chg_pct": 3.45,
+            "daily_chg_val": 50.0,
             "source_currency": "USD",
         }
     ]

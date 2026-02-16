@@ -6,7 +6,7 @@ A professional terminal-based portfolio tracker that provides real-time stock pr
 
 ## Features
 
-- 📊 **Real-time Portfolio Summary**: Tracks price, quantity, and daily % change with a clean, formatted table.
+- 📊 **Real-time Portfolio Summary**: Tracks price, quantity, daily change, and monthly % change with a clean, formatted table.
 - 💰 **Dividend Calendar**: Displays upcoming ex-dividend dates and estimated payout amounts.
 - 💱 **Multi-Currency Support**: Automatically converts holdings to your target currency (USD, EUR, SEK, etc.) using live exchange rates.
 - ⌚ **Watch Mode**: Update your portfolio in real-time with the `--watch` flag.
