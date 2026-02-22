@@ -15,6 +15,7 @@ from rich.live import Live
 from rich.console import Group
 from datetime import datetime
 import pandas as pd
+import pytz
 
 try:
     from importlib.metadata import version
@@ -128,9 +129,30 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
         conv = get_rate(source_currency, target_currency, rate_cache)
 
         if price is not None and conv is not None:
+            # Check if market has opened today
+            is_today = False
+            try:
+                tz_name = fi.get("timezone", "UTC")
+                tz = pytz.timezone(tz_name)
+                today = datetime.now(tz).date()
+
+                # Using history(period='1d') to get the latest session date
+                hist = t.history(period="1d")
+                if not hist.empty:
+                    last_date = hist.index[-1].date()
+                    if last_date == today:
+                        is_today = True
+            except Exception:
+                is_today = True  # Fallback to showing change
+
             val_now = (price * conv) * qty
-            val_prev = (prev_close * conv) * qty if prev_close else val_now
-            chg_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0
+            if is_today:
+                val_prev = (prev_close * conv) * qty if prev_close else val_now
+                chg_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0
+            else:
+                val_prev = val_now
+                chg_pct = 0
+
             daily_chg_val = val_now - val_prev
             return {
                 "symbol": symbol,
