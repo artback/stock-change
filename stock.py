@@ -124,7 +124,7 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
         t = yf.Ticker(symbol)
         fi = t.fast_info
         price = fi.get("lastPrice")
-        prev_close = fi.get("previousClose")
+        prev_close = fi.get("regularMarketPreviousClose") or fi.get("previousClose")
         source_currency = fi.get("currency", "USD")
         conv = get_rate(source_currency, target_currency, rate_cache)
 
