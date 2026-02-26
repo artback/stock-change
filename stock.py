@@ -6,6 +6,8 @@ import time
 import argparse
 import concurrent.futures
 import sys
+import termios
+import select
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
@@ -137,11 +139,15 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
                 today = datetime.now(tz).date()
 
                 # Using history(period='1d') to get the latest session date
-                hist = t.history(period="1d")
-                if not hist.empty:
-                    last_date = hist.index[-1].date()
-                    if last_date == today:
-                        is_today = True
+                try:
+                    hist = t.history(period="1d", timeout=5)
+                    if not hist.empty:
+                        last_date = hist.index[-1].date()
+                        if last_date == today:
+                            is_today = True
+                except Exception:
+                    # Fallback if history fails
+                    is_today = True
             except Exception:
                 is_today = True  # Fallback to showing change
 
@@ -200,53 +206,21 @@ def get_dividend_data(summary_data):
 
 def render_sparkline(values):
 
-
     if not values or len(values) < 2:
-
-
         return ""
-
-
-
-
 
     # Use horizontal segments at different heights for a clean, bold line
 
-
     chars = ["⎽", "⎼", "⎻", "⎺"]
-
-
-    
-
 
     min_v, max_v = min(values), max(values)
 
-
     span = max_v - min_v
 
-
     if span <= 0:
-
-
         return "─" * len(values)
 
-
-    
-
-
     return "".join(chars[min(int((v - min_v) / span * 3), 3)] for v in values)
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def fetch_history(holdings, target_currency, ticker_to_currency):
@@ -259,7 +233,12 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
 
         all_to_fetch = symbols + rate_pairs
         df = yf.download(
-            all_to_fetch, period="1mo", interval="1d", progress=False, threads=True
+            all_to_fetch,
+            period="1mo",
+            interval="1d",
+            progress=False,
+            threads=True,
+            timeout=10,
         )
 
         if df.empty:
@@ -333,7 +312,9 @@ def build_display_group(
         width=15,
         no_wrap=True,
     )
-    table.add_column(f"Daily ({target_symbol})", justify="right", width=12, no_wrap=True)
+    table.add_column(
+        f"Daily ({target_symbol})", justify="right", width=12, no_wrap=True
+    )
     table.add_column("Day %", justify="right", width=10, no_wrap=True)
     table.add_column("Month %", justify="right", width=10, no_wrap=True)
 
@@ -342,7 +323,7 @@ def build_display_group(
     for s in sorted(summary_results, key=lambda x: x["symbol"]):
         total_val += s["val_now"]
         total_prev += s["val_prev"]
-        
+
         m_chg = monthly_changes.get(s["symbol"])
         m_text = (
             Text(f"{m_chg:+.2f}%", style="green" if m_chg >= 0 else "red")
@@ -442,6 +423,11 @@ def fetch_portfolio():
     target_currency = (args.currency or config["currency"]).upper()
     holdings = config["holdings"]
 
+    # Set terminal title
+    if sys.stdout.isatty():
+        sys.stdout.write("\033]0;Stock Price\007")
+        sys.stdout.flush()
+
     try:
         if not validate_currency(target_currency):
             console.print(
@@ -449,12 +435,13 @@ def fetch_portfolio():
             )
             sys.exit(1)
 
-        last_summary = []
-        last_dividends = []
+        summary_cache = {}
+        dividend_cache = {}
         history_points = []
         monthly_changes = {}
         last_history_update = 0
         ticker_to_currency = {}
+        last_update = "Initializing..."
 
         with Live(
             build_display_group([], [], target_currency, "Initializing..."),
@@ -463,97 +450,140 @@ def fetch_portfolio():
             transient=True,
             screen=args.watch,
         ) as live:
-            while True:
-                current_summary = []
-                current_dividends = []
-                rate_cache = {}
+            # Enable focus reporting and non-canonical mode for immediate reload on focus
+            old_attr = None
+            if args.watch and sys.stdin.isatty():
+                try:
+                    sys.stdout.write("\033[?1004h")
+                    sys.stdout.flush()
+                    old_attr = termios.tcgetattr(sys.stdin)
+                    new_attr = termios.tcgetattr(sys.stdin)
+                    new_attr[3] &= ~termios.ICANON
+                    new_attr[3] &= ~termios.ECHO
+                    termios.tcsetattr(sys.stdin, termios.TCSANOW, new_attr)
+                except Exception:
+                    pass
 
-                # Fetch data
-                num_holdings = len(holdings)
-                completed = 0
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=num_holdings
-                ) as executor:
-                    futures = [
-                        executor.submit(
-                            get_ticker_summary, s, q, target_currency, rate_cache
-                        )
-                        for s, q in holdings.items()
-                    ]
-                    for future in concurrent.futures.as_completed(futures):
-                        res = future.result()
-                        completed += 1
-                        if res:
-                            current_summary.append(res)
-                            ticker_to_currency[res["symbol"]] = res["source_currency"]
+            try:
+                while True:
+                    rate_cache = {}
 
-                        # Only update if data changed or first run to show progress
-                        display_summary = (
-                            current_summary if not last_summary else last_summary
-                        )
-                        live.update(
-                            build_display_group(
-                                display_summary,
-                                last_dividends,
-                                target_currency,
-                                f"Updating ({completed}/{num_holdings})...",
-                                history_points,
-                                monthly_changes,
-                            )
-                        )
-
-                # Fetch 30D history if needed (every 120s)
-                now = time.time()
-                if ticker_to_currency and (
-                    now - last_history_update > 120 or not history_points
-                ):
-                    history_points, monthly_changes = fetch_history(
-                        holdings, target_currency, ticker_to_currency
-                    )
-                    last_history_update = now
-
-                if current_summary:
+                    # Fetch data
+                    num_holdings = len(holdings)
+                    completed = 0
                     with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=len(current_summary)
+                        max_workers=num_holdings
                     ) as executor:
-                        div_futures = [
-                            executor.submit(get_dividend_data, s)
-                            for s in current_summary
-                        ]
-                        for future in concurrent.futures.as_completed(div_futures):
-                            res = future.result()
-                            if res:
-                                current_dividends.append(res)
+                        future_to_symbol = {
+                            executor.submit(
+                                get_ticker_summary, s, q, target_currency, rate_cache
+                            ): s
+                            for s, q in holdings.items()
+                        }
+                        try:
+                            for future in concurrent.futures.as_completed(
+                                future_to_symbol, timeout=15
+                            ):
+                                res = future.result()
+                                symbol = future_to_symbol[future]
+                                completed += 1
+                                if res:
+                                    summary_cache[symbol] = res
+                                    ticker_to_currency[symbol] = res["source_currency"]
 
-                # Update persistent results
-                last_summary, last_dividends = current_summary, current_dividends
-                last_update = datetime.now().strftime("%H:%M:%S")
+                                live.update(
+                                    build_display_group(
+                                        list(summary_cache.values()),
+                                        list(dividend_cache.values()),
+                                        target_currency,
+                                        f"Updating ({completed}/{num_holdings})...",
+                                        history_points,
+                                        monthly_changes,
+                                    )
+                                )
+                        except concurrent.futures.TimeoutError:
+                            # Continue with what we have if some requests timed out
+                            pass
 
-                if not args.watch:
-                    break
+                    # Fetch 30D history if needed (every 120s)
+                    now = time.time()
+                    if ticker_to_currency and (
+                        now - last_history_update > 120 or not history_points
+                    ):
+                        new_history, new_monthly = fetch_history(
+                            holdings, target_currency, ticker_to_currency
+                        )
+                        if new_history:
+                            history_points = new_history
+                        if new_monthly:
+                            monthly_changes.update(new_monthly)
+                        last_history_update = now
 
-                # Update display with last update time and wait
-                msg = f"Last update: {last_update} | Ctrl+C to exit"
-                live.update(
-                    build_display_group(
-                        last_summary,
-                        last_dividends,
-                        target_currency,
-                        msg,
-                        history_points,
-                        monthly_changes,
+                    if summary_cache:
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=len(summary_cache)
+                        ) as executor:
+                            div_future_to_symbol = {
+                                executor.submit(get_dividend_data, s): s["symbol"]
+                                for s in summary_cache.values()
+                            }
+                            for future in concurrent.futures.as_completed(
+                                div_future_to_symbol
+                            ):
+                                res = future.result()
+                                symbol = div_future_to_symbol[future]
+                                if res:
+                                    dividend_cache[symbol] = res
+
+                    last_update = datetime.now().strftime("%H:%M:%S")
+
+                    if not args.watch:
+                        break
+
+                    # Update display with last update time and wait
+                    msg = f"Last update: {last_update} | Ctrl+C to exit"
+                    live.update(
+                        build_display_group(
+                            list(summary_cache.values()),
+                            list(dividend_cache.values()),
+                            target_currency,
+                            msg,
+                            history_points,
+                            monthly_changes,
+                        )
                     )
-                )
 
-                # Smooth wait loop (5 seconds)
-                for _ in range(50):
-                    time.sleep(0.1)
+                    # Smooth wait loop (5 seconds)
+                    start_wait = time.time()
+                    triggered = False
+                    for _ in range(50):
+                        time.sleep(0.1)
+                        # Trigger reload on focus gain or any key press
+                        if args.watch and sys.stdin.isatty():
+                            if select.select([sys.stdin], [], [], 0)[0]:
+                                while select.select([sys.stdin], [], [], 0)[0]:
+                                    sys.stdin.read(1)
+                                triggered = True
+                                break
+                        # Trigger reload if system was likely asleep (large time jump)
+                        if time.time() - start_wait > 10:
+                            triggered = True
+                            break
+
+                    if triggered:
+                        continue
+            finally:
+                if args.watch and sys.stdin.isatty():
+                    sys.stdout.write("\033[?1004l")
+                    sys.stdout.flush()
+                    if old_attr:
+                        termios.tcsetattr(sys.stdin, termios.TCSANOW, old_attr)
 
         if not args.watch:
             console.print(
                 build_display_group(
-                    last_summary,
-                    last_dividends,
+                    list(summary_cache.values()),
+                    list(dividend_cache.values()),
                     target_currency,
                     "",
                     history_points,
