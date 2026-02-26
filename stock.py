@@ -7,7 +7,6 @@ import argparse
 import concurrent.futures
 import sys
 import termios
-import tty
 import select
 from pathlib import Path
 from rich.console import Console
@@ -207,53 +206,21 @@ def get_dividend_data(summary_data):
 
 def render_sparkline(values):
 
-
     if not values or len(values) < 2:
-
-
         return ""
-
-
-
-
 
     # Use horizontal segments at different heights for a clean, bold line
 
-
     chars = ["⎽", "⎼", "⎻", "⎺"]
-
-
-    
-
 
     min_v, max_v = min(values), max(values)
 
-
     span = max_v - min_v
 
-
     if span <= 0:
-
-
         return "─" * len(values)
 
-
-    
-
-
     return "".join(chars[min(int((v - min_v) / span * 3), 3)] for v in values)
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def fetch_history(holdings, target_currency, ticker_to_currency):
@@ -345,7 +312,9 @@ def build_display_group(
         width=15,
         no_wrap=True,
     )
-    table.add_column(f"Daily ({target_symbol})", justify="right", width=12, no_wrap=True)
+    table.add_column(
+        f"Daily ({target_symbol})", justify="right", width=12, no_wrap=True
+    )
     table.add_column("Day %", justify="right", width=10, no_wrap=True)
     table.add_column("Month %", justify="right", width=10, no_wrap=True)
 
@@ -354,7 +323,7 @@ def build_display_group(
     for s in sorted(summary_results, key=lambda x: x["symbol"]):
         total_val += s["val_now"]
         total_prev += s["val_prev"]
-        
+
         m_chg = monthly_changes.get(s["symbol"])
         m_text = (
             Text(f"{m_chg:+.2f}%", style="green" if m_chg >= 0 else "red")
@@ -520,9 +489,7 @@ def fetch_portfolio():
                                 completed += 1
                                 if res:
                                     summary_cache[symbol] = res
-                                    ticker_to_currency[symbol] = res[
-                                        "source_currency"
-                                    ]
+                                    ticker_to_currency[symbol] = res["source_currency"]
 
                                 live.update(
                                     build_display_group(
@@ -602,7 +569,7 @@ def fetch_portfolio():
                         if time.time() - start_wait > 10:
                             triggered = True
                             break
-                    
+
                     if triggered:
                         continue
             finally:
