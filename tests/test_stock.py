@@ -1,5 +1,4 @@
-import math
-from datetime import date, datetime
+from datetime import date
 from unittest.mock import MagicMock
 
 import pandas as pd

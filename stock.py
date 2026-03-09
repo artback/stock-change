@@ -15,7 +15,6 @@ from rich.live import Live
 from rich.console import Group
 from datetime import datetime
 import pandas as pd
-import pytz
 
 try:
     import termios
