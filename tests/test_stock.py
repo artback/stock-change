@@ -1,5 +1,6 @@
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -8,12 +9,16 @@ from rich.console import Console
 from stock import (
     CURRENCY_SYMBOLS,
     DEFAULT_HOLDINGS,
+    DEFAULT_SCHEDULE,
+    EXCHANGE_SCHEDULES,
     KNOWN_CURRENCIES,
+    _get_exchange_suffix,
     build_display_group,
     fetch_history,
     get_dividend_data,
     get_rate,
     get_ticker_summary,
+    is_any_market_open,
     load_config,
     render_sparkline,
     validate_currency,
@@ -567,6 +572,76 @@ class TestBuildDisplayGroup:
         group = build_display_group([s], [], "USD")
         output = _render(group)
         assert "AAPL" in output  # should not crash
+
+
+# ---------------------------------------------------------------------------
+# Market status detection
+# ---------------------------------------------------------------------------
+
+class TestGetExchangeSuffix:
+    def test_stockholm(self):
+        assert _get_exchange_suffix("SVOL-B.ST") == ".ST"
+
+    def test_paris(self):
+        assert _get_exchange_suffix("MC.PA") == ".PA"
+
+    def test_no_suffix(self):
+        assert _get_exchange_suffix("AAPL") is None
+
+    def test_german(self):
+        assert _get_exchange_suffix("IUSA.DE") == ".DE"
+
+
+class TestIsAnyMarketOpen:
+    def test_weekday_during_us_hours(self):
+        # Wednesday 10:00 AM ET
+        now = datetime(2026, 3, 11, 15, 0, 0, tzinfo=ZoneInfo("UTC"))  # 10 AM ET
+        assert is_any_market_open({"AAPL": 10}, now=now) is True
+
+    def test_weekday_outside_us_hours(self):
+        # Wednesday 10:00 PM ET (after close)
+        now = datetime(2026, 3, 12, 3, 0, 0, tzinfo=ZoneInfo("UTC"))  # 10 PM ET
+        assert is_any_market_open({"AAPL": 10}, now=now) is False
+
+    def test_saturday(self):
+        # Saturday 12:00 UTC
+        now = datetime(2026, 3, 14, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
+        assert is_any_market_open({"AAPL": 10}, now=now) is False
+
+    def test_sunday(self):
+        # Sunday 12:00 UTC
+        now = datetime(2026, 3, 15, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
+        assert is_any_market_open({"SVOL-B.ST": 100}, now=now) is False
+
+    def test_stockholm_open(self):
+        # Wednesday 10:00 Stockholm time = 09:00 UTC
+        now = datetime(2026, 3, 11, 9, 0, 0, tzinfo=ZoneInfo("UTC"))
+        assert is_any_market_open({"SVOL-B.ST": 100}, now=now) is True
+
+    def test_stockholm_closed_evening(self):
+        # Wednesday 19:00 Stockholm time = 18:00 UTC
+        now = datetime(2026, 3, 11, 18, 0, 0, tzinfo=ZoneInfo("UTC"))
+        assert is_any_market_open({"SVOL-B.ST": 100}, now=now) is False
+
+    def test_mixed_exchanges_one_open(self):
+        # Wednesday 14:30 UTC — US market open (9:30 ET), Stockholm closed (15:30 CET > 17)
+        # Actually 14:30 UTC = 15:30 CET (still open until 17 CET) and 9:30 ET (open)
+        now = datetime(2026, 3, 11, 14, 30, 0, tzinfo=ZoneInfo("UTC"))
+        holdings = {"AAPL": 10, "SVOL-B.ST": 100}
+        assert is_any_market_open(holdings, now=now) is True
+
+    def test_mixed_exchanges_all_closed(self):
+        # Wednesday 23:00 UTC — all closed
+        now = datetime(2026, 3, 11, 23, 0, 0, tzinfo=ZoneInfo("UTC"))
+        holdings = {"AAPL": 10, "SVOL-B.ST": 100}
+        assert is_any_market_open(holdings, now=now) is False
+
+    def test_exchange_schedules_has_common_exchanges(self):
+        for suffix in [".ST", ".PA", ".DE", ".L", ".T", ".HK"]:
+            assert suffix in EXCHANGE_SCHEDULES
+
+    def test_default_schedule_is_nyse(self):
+        assert DEFAULT_SCHEDULE == ("America/New_York", 9, 16)
 
 
 # ---------------------------------------------------------------------------

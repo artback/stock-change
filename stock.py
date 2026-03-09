@@ -14,6 +14,7 @@ from rich.text import Text
 from rich.live import Live
 from rich.console import Group
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 try:
@@ -58,6 +59,66 @@ CURRENCY_SYMBOLS = {
     "CAD": "C$",
     "AUD": "A$",
 }
+
+
+EXCHANGE_SCHEDULES = {
+    ".ST": ("Europe/Stockholm", 9, 17),
+    ".HE": ("Europe/Helsinki", 10, 18),
+    ".CO": ("Europe/Copenhagen", 9, 17),
+    ".OL": ("Europe/Oslo", 9, 16),
+    ".PA": ("Europe/Paris", 9, 17),
+    ".DE": ("Europe/Berlin", 9, 17),
+    ".AS": ("Europe/Amsterdam", 9, 17),
+    ".BR": ("Europe/Brussels", 9, 17),
+    ".MI": ("Europe/Rome", 9, 17),
+    ".MC": ("Europe/Madrid", 9, 17),
+    ".SW": ("Europe/Zurich", 9, 17),
+    ".VI": ("Europe/Vienna", 9, 17),
+    ".L": ("Europe/London", 8, 16),
+    ".LS": ("Europe/Lisbon", 8, 16),
+    ".T": ("Asia/Tokyo", 9, 15),
+    ".HK": ("Asia/Hong_Kong", 9, 16),
+    ".SI": ("Asia/Singapore", 9, 17),
+    ".AX": ("Australia/Sydney", 10, 16),
+    ".NZ": ("Pacific/Auckland", 10, 16),
+    ".TO": ("America/Toronto", 9, 16),
+    ".SA": ("America/Sao_Paulo", 10, 17),
+    ".MX": ("America/Mexico_City", 8, 15),
+}
+
+DEFAULT_SCHEDULE = ("America/New_York", 9, 16)
+
+
+def _get_exchange_suffix(symbol):
+    dot = symbol.rfind(".")
+    if dot > 0:
+        return symbol[dot:]
+    return None
+
+
+def is_any_market_open(holdings, now=None):
+    if now is None:
+        now = datetime.now(ZoneInfo("UTC"))
+
+    suffixes = set()
+    for symbol in holdings:
+        suffix = _get_exchange_suffix(symbol)
+        suffixes.add(suffix)
+
+    schedules = set()
+    for suffix in suffixes:
+        if suffix and suffix in EXCHANGE_SCHEDULES:
+            schedules.add(EXCHANGE_SCHEDULES[suffix])
+        else:
+            schedules.add(DEFAULT_SCHEDULE)
+
+    for tz_name, open_hour, close_hour in schedules:
+        tz = ZoneInfo(tz_name)
+        local_now = now.astimezone(tz)
+        if local_now.weekday() < 5 and open_hour <= local_now.hour < close_hour:
+            return True
+
+    return False
 
 
 def load_config(config_path=None):
@@ -562,7 +623,10 @@ def fetch_portfolio():
                     if not args.watch:
                         break
 
-                    msg = f"Last update: {last_update} | Next in {interval}s | Ctrl+C to exit"
+                    market_open = is_any_market_open(holdings)
+                    effective_interval = interval if market_open else max(interval, 300)
+                    market_tag = "" if market_open else " | [Market Closed]"
+                    msg = f"Last update: {last_update} | Next in {effective_interval}s{market_tag} | Ctrl+C to exit"
                     live.update(
                         build_display_group(
                             list(summary_cache.values()),
@@ -576,7 +640,7 @@ def fetch_portfolio():
 
                     start_wait = time.time()
                     triggered = False
-                    ticks = interval * 10
+                    ticks = effective_interval * 10
                     for _ in range(ticks):
                         time.sleep(0.1)
                         if args.watch and sys.stdin.isatty() and select_mod:
