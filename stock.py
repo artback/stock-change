@@ -6,8 +6,6 @@ import time
 import argparse
 import concurrent.futures
 import sys
-import termios
-import select
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
@@ -17,7 +15,13 @@ from rich.live import Live
 from rich.console import Group
 from datetime import datetime
 import pandas as pd
-import pytz
+
+try:
+    import termios
+    import select as select_mod
+except ImportError:
+    termios = None
+    select_mod = None
 
 try:
     from importlib.metadata import version
@@ -84,11 +88,14 @@ def load_config(config_path=None):
     return config_data
 
 
+KNOWN_CURRENCIES = {"EUR", "USD", "GBP", "SEK", "JPY", "CHF", "CAD", "AUD", "NOK", "DKK", "CNY", "HKD", "SGD", "NZD", "KRW", "INR", "BRL", "MXN", "ZAR", "TRY", "PLN", "CZK", "HUF", "ILS", "TWD", "THB"}
+
+
 def validate_currency(currency_code):
     currency_code = currency_code.upper()
     if len(currency_code) != 3:
         return False
-    if currency_code == "USD":
+    if currency_code in KNOWN_CURRENCIES:
         return True
     try:
         ticker = yf.Ticker(f"USD{currency_code}=X")
@@ -131,28 +138,8 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
         conv = get_rate(source_currency, target_currency, rate_cache)
 
         if price is not None and not pd.isna(price) and conv is not None and not pd.isna(conv):
-            # Check if market has opened today
-            is_today = False
-            try:
-                tz_name = fi.get("timezone", "UTC")
-                tz = pytz.timezone(tz_name)
-                today = datetime.now(tz).date()
-
-                # Using history(period='1d') to get the latest session date
-                try:
-                    hist = t.history(period="1d", timeout=5)
-                    if not hist.empty:
-                        last_date = hist.index[-1].date()
-                        if last_date == today:
-                            is_today = True
-                except Exception:
-                    # Fallback if history fails
-                    is_today = True
-            except Exception:
-                is_today = True  # Fallback to showing change
-
             val_now = (price * conv) * qty
-            if is_today and prev_close and not pd.isna(prev_close):
+            if prev_close and not pd.isna(prev_close):
                 val_prev = (prev_close * conv) * qty
                 chg_pct = ((price - prev_close) / prev_close) * 100
             else:
@@ -327,6 +314,7 @@ def build_display_group(
 
     total_val = 0
     total_prev = 0
+    total_daily_chg = 0
     for s in sorted(summary_results, key=lambda x: x["symbol"]):
         val_now = s["val_now"]
         val_prev = s["val_prev"]
@@ -339,6 +327,8 @@ def build_display_group(
             total_prev += val_prev
         else:
             total_prev += val_now if not pd.isna(val_now) else 0
+        if not pd.isna(daily_chg):
+            total_daily_chg += daily_chg
 
         m_chg = monthly_changes.get(s["symbol"])
         m_text = (
@@ -363,6 +353,28 @@ def build_display_group(
             m_text,
         )
 
+    if summary_results:
+        total_chg_pct = (
+            ((total_val - total_prev) / total_prev) * 100
+            if total_prev != 0
+            else 0
+        )
+        table.add_section()
+        table.add_row(
+            Text("TOTAL", style="bold"),
+            "",
+            Text(f"{total_val:,.2f} {target_symbol}", style="bold white"),
+            Text(
+                f"{total_daily_chg:+,.2f} {target_symbol}",
+                style="bold green" if total_daily_chg >= 0 else "bold red",
+            ),
+            Text(
+                f"{total_chg_pct:+.2f}%",
+                style="bold green" if total_chg_pct >= 0 else "bold red",
+            ),
+            Text(""),
+        )
+
     # 2. Dividends Table
     div_table = None
     if dividend_results:
@@ -385,33 +397,19 @@ def build_display_group(
                 f"{d['total_p']:,.2f} {target_symbol}",
             )
 
-    # 3. Summary Panel
+    # 3. Sparkline Panel
     summary_panel = None
-    if total_val > 0:
-        day_chg_pct = (
-            ((total_val - total_prev) / total_prev) * 100 if total_prev != 0 else 0
-        )
-        day_chg_val = total_val - total_prev
-        summary_text = Text.assemble(
-            ("TOTAL VALUE:  ", "white"),
-            (f"{total_val:,.2f} {target_symbol}\n", "bold white"),
-            ("DAY CHANGE:   ", "white"),
-            (
-                f"{day_chg_val:+,.2f} {target_symbol} ",
-                "bold green" if day_chg_val >= 0 else "bold red",
-            ),
-            (
-                f"({day_chg_pct:+.2f}%)",
-                "bold green" if day_chg_pct >= 0 else "bold red",
-            ),
-        )
-
-        if history_points and len(history_points) > 1:
-            spark = render_sparkline(history_points)
-            summary_text.append("\n\n")
-            summary_text.append("30D DEVELOPMENT:\n", style="dim")
-            summary_text.append(spark, style="bright_cyan")
-
+    if total_val > 0 and history_points and len(history_points) > 1:
+        spark = render_sparkline(history_points)
+        summary_text = Text()
+        summary_text.append("30D TREND: ", style="dim")
+        summary_text.append(spark, style="bright_cyan")
+        if len(history_points) >= 2:
+            month_chg = ((history_points[-1] - history_points[0]) / history_points[0]) * 100
+            summary_text.append(
+                f"  {month_chg:+.2f}%",
+                style="bold green" if month_chg >= 0 else "bold red",
+            )
         summary_panel = Panel(summary_text, border_style="bright_blue", expand=False)
 
     # 4. Footer
@@ -434,7 +432,10 @@ def fetch_portfolio():
     )
     parser.add_argument("-c", "--currency", help="Output currency (e.g. USD, EUR, SEK)")
     parser.add_argument(
-        "-w", "--watch", action="store_true", help="Watch mode: update every 5 seconds"
+        "-w", "--watch", action="store_true", help="Watch mode: auto-refresh"
+    )
+    parser.add_argument(
+        "-i", "--interval", type=int, default=30, help="Watch mode refresh interval in seconds (default: 30)"
     )
     parser.add_argument("--config", help="Path to a custom YAML configuration file")
     args = parser.parse_args()
@@ -460,8 +461,11 @@ def fetch_portfolio():
         history_points = []
         monthly_changes = {}
         last_history_update = 0
+        last_dividend_update = 0
         ticker_to_currency = {}
+        rate_cache = {}
         last_update = "Initializing..."
+        interval = max(5, args.interval)
 
         with Live(
             build_display_group([], [], target_currency, "Initializing..."),
@@ -470,9 +474,8 @@ def fetch_portfolio():
             transient=True,
             screen=args.watch,
         ) as live:
-            # Enable focus reporting and non-canonical mode for immediate reload on focus
             old_attr = None
-            if args.watch and sys.stdin.isatty():
+            if args.watch and sys.stdin.isatty() and termios:
                 try:
                     sys.stdout.write("\033[?1004h")
                     sys.stdout.flush()
@@ -486,8 +489,6 @@ def fetch_portfolio():
 
             try:
                 while True:
-                    rate_cache = {}
-
                     # Fetch data
                     num_holdings = len(holdings)
                     completed = 0
@@ -539,7 +540,7 @@ def fetch_portfolio():
                             monthly_changes.update(new_monthly)
                         last_history_update = now
 
-                    if summary_cache:
+                    if summary_cache and (now - last_dividend_update > 600 or not dividend_cache):
                         with concurrent.futures.ThreadPoolExecutor(
                             max_workers=len(summary_cache)
                         ) as executor:
@@ -554,14 +555,14 @@ def fetch_portfolio():
                                 symbol = div_future_to_symbol[future]
                                 if res:
                                     dividend_cache[symbol] = res
+                        last_dividend_update = now
 
                     last_update = datetime.now().strftime("%H:%M:%S")
 
                     if not args.watch:
                         break
 
-                    # Update display with last update time and wait
-                    msg = f"Last update: {last_update} | Ctrl+C to exit"
+                    msg = f"Last update: {last_update} | Next in {interval}s | Ctrl+C to exit"
                     live.update(
                         build_display_group(
                             list(summary_cache.values()),
@@ -573,27 +574,26 @@ def fetch_portfolio():
                         )
                     )
 
-                    # Smooth wait loop (5 seconds)
                     start_wait = time.time()
                     triggered = False
-                    for _ in range(50):
+                    ticks = interval * 10
+                    for _ in range(ticks):
                         time.sleep(0.1)
-                        # Trigger reload on focus gain or any key press
-                        if args.watch and sys.stdin.isatty():
-                            if select.select([sys.stdin], [], [], 0)[0]:
-                                while select.select([sys.stdin], [], [], 0)[0]:
+                        if args.watch and sys.stdin.isatty() and select_mod:
+                            if select_mod.select([sys.stdin], [], [], 0)[0]:
+                                while select_mod.select([sys.stdin], [], [], 0)[0]:
                                     sys.stdin.read(1)
                                 triggered = True
                                 break
-                        # Trigger reload if system was likely asleep (large time jump)
-                        if time.time() - start_wait > 10:
+                        if time.time() - start_wait > interval + 5:
                             triggered = True
                             break
 
                     if triggered:
+                        rate_cache.clear()
                         continue
             finally:
-                if args.watch and sys.stdin.isatty():
+                if args.watch and sys.stdin.isatty() and termios:
                     sys.stdout.write("\033[?1004l")
                     sys.stdout.flush()
                     if old_attr:
