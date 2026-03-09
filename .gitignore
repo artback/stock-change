@@ -11,5 +11,8 @@ dist/
 # macOS
 .DS_Store
 
+# Testing
+.coverage
+
 # Environment
 .env
