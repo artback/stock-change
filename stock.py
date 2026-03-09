@@ -130,7 +130,7 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
         source_currency = fi.get("currency", "USD")
         conv = get_rate(source_currency, target_currency, rate_cache)
 
-        if price is not None and conv is not None:
+        if price is not None and not pd.isna(price) and conv is not None and not pd.isna(conv):
             # Check if market has opened today
             is_today = False
             try:
@@ -152,9 +152,9 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
                 is_today = True  # Fallback to showing change
 
             val_now = (price * conv) * qty
-            if is_today:
-                val_prev = (prev_close * conv) * qty if prev_close else val_now
-                chg_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0
+            if is_today and prev_close and not pd.isna(prev_close):
+                val_prev = (prev_close * conv) * qty
+                chg_pct = ((price - prev_close) / prev_close) * 100
             else:
                 val_prev = val_now
                 chg_pct = 0
@@ -182,7 +182,7 @@ def get_dividend_data(summary_data):
         cal = t.calendar
         if cal and "Ex-Dividend Date" in cal:
             ex_date = cal["Ex-Dividend Date"]
-            if ex_date and ex_date >= datetime.now().date():
+            if ex_date and not pd.isna(ex_date) and ex_date >= datetime.now().date():
                 d_info = t.info
                 div_amt = (
                     d_info.get("lastDividendValue") or d_info.get("dividendRate") or 0
@@ -213,14 +213,21 @@ def render_sparkline(values):
 
     chars = ["⎽", "⎼", "⎻", "⎺"]
 
-    min_v, max_v = min(values), max(values)
+    clean_values = [v for v in values if not pd.isna(v)]
+    if not clean_values or len(clean_values) < 2:
+        return ""
+
+    min_v, max_v = min(clean_values), max(clean_values)
 
     span = max_v - min_v
 
     if span <= 0:
         return "─" * len(values)
 
-    return "".join(chars[min(int((v - min_v) / span * 3), 3)] for v in values)
+    return "".join(
+        (chars[min(int((v - min_v) / span * 3), 3)] if not pd.isna(v) else " ")
+        for v in values
+    )
 
 
 def fetch_history(holdings, target_currency, ticker_to_currency):
@@ -321,27 +328,38 @@ def build_display_group(
     total_val = 0
     total_prev = 0
     for s in sorted(summary_results, key=lambda x: x["symbol"]):
-        total_val += s["val_now"]
-        total_prev += s["val_prev"]
+        val_now = s["val_now"]
+        val_prev = s["val_prev"]
+        daily_chg = s["daily_chg_val"]
+        chg_pct = s["chg_pct"]
+
+        if not pd.isna(val_now):
+            total_val += val_now
+        if not pd.isna(val_prev):
+            total_prev += val_prev
+        else:
+            total_prev += val_now if not pd.isna(val_now) else 0
 
         m_chg = monthly_changes.get(s["symbol"])
         m_text = (
             Text(f"{m_chg:+.2f}%", style="green" if m_chg >= 0 else "red")
-            if m_chg is not None
+            if m_chg is not None and not pd.isna(m_chg)
             else Text("-", style="dim")
         )
 
         table.add_row(
             s["symbol"],
             f"{s['qty']:,}",
-            f"{s['val_now']:,.2f} {target_symbol}",
+            f"{val_now:,.2f} {target_symbol}" if not pd.isna(val_now) else "-",
             Text(
-                f"{s['daily_chg_val']:+,.2f} {target_symbol}",
-                style="green" if s["daily_chg_val"] >= 0 else "red",
-            ),
-            Text(
-                f"{s['chg_pct']:+.2f}%", style="green" if s["chg_pct"] >= 0 else "red"
-            ),
+                f"{daily_chg:+,.2f} {target_symbol}",
+                style="green" if daily_chg >= 0 else "red",
+            )
+            if not pd.isna(daily_chg)
+            else Text("-", style="dim"),
+            Text(f"{chg_pct:+.2f}%", style="green" if chg_pct >= 0 else "red")
+            if not pd.isna(chg_pct)
+            else Text("-", style="dim"),
             m_text,
         )
 
@@ -369,8 +387,10 @@ def build_display_group(
 
     # 3. Summary Panel
     summary_panel = None
-    if total_prev > 0:
-        day_chg_pct = ((total_val - total_prev) / total_prev) * 100
+    if total_val > 0:
+        day_chg_pct = (
+            ((total_val - total_prev) / total_prev) * 100 if total_prev != 0 else 0
+        )
         day_chg_val = total_val - total_prev
         summary_text = Text.assemble(
             ("TOTAL VALUE:  ", "white"),
