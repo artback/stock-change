@@ -11,8 +11,6 @@ dependencies = [
     "rich>=13.7.0",
     "python-dotenv>=1.0.0",
     "PyYAML>=6.0.0",
-    "pytest>=8.0.0",
-    "pytest-mock>=3.12.0"
 ]
 requires-python = ">=3.10"
 
@@ -20,6 +18,8 @@ requires-python = ">=3.10"
 dev = [
     "black>=24.0.0",
     "ruff>=0.3.0",
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
     "pytest-cov>=4.1.0",
     "pre-commit>=3.6.0"
 ]
@@ -29,6 +29,15 @@ stock-price = "stock:fetch_portfolio"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+addopts = "--cov=stock --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["stock"]
+omit = ["tests/*", "venv/*", ".venv/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 60
 
 [tool.setuptools]
 py-modules = ["stock"]
