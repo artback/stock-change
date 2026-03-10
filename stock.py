@@ -356,6 +356,10 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
             sym = all_to_fetch[0]
             close_data = pd.DataFrame({sym: close_data})
 
+        # Forward-fill missing prices so days with partial data
+        # don't cause the portfolio total to drop artificially.
+        close_data = close_data.ffill()
+
         # Calculate monthly change for each ticker
         monthly_changes = {}
         for sym in symbols:
