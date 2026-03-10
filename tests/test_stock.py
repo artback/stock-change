@@ -16,6 +16,7 @@ from stock import (
     build_display_group,
     fetch_history,
     get_dividend_data,
+    get_news_data,
     get_rate,
     get_ticker_summary,
     is_any_market_open,
@@ -572,6 +573,145 @@ class TestBuildDisplayGroup:
         group = build_display_group([s], [], "USD")
         output = _render(group)
         assert "AAPL" in output  # should not crash
+
+
+# ---------------------------------------------------------------------------
+# News
+# ---------------------------------------------------------------------------
+
+class TestGetNewsData:
+    def _make_article(self, title, pub_date, provider="Test", summary="Some summary"):
+        return {
+            "content": {
+                "title": title,
+                "pubDate": pub_date,
+                "summary": summary,
+                "provider": {"displayName": provider},
+                "clickThroughUrl": {"url": f"https://example.com/{title.replace(' ', '-')}"},
+                "canonicalUrl": {"url": f"https://example.com/canonical/{title.replace(' ', '-')}"},
+            }
+        }
+
+    def test_basic_fetch(self, mocker):
+        mock_ticker = MagicMock()
+        mock_ticker.news = [
+            self._make_article("Breaking News", "2026-03-05T10:00:00Z"),
+        ]
+        mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
+        result = get_news_data(["AAPL"])
+        assert len(result) == 1
+        assert result[0]["title"] == "Breaking News"
+        assert result[0]["symbol"] == "AAPL"
+        assert result[0]["link"] == "https://example.com/Breaking-News"
+        assert result[0]["summary"] == "Some summary"
+
+    def test_filters_old_articles(self, mocker):
+        mock_ticker = MagicMock()
+        mock_ticker.news = [
+            self._make_article("Recent", "2026-03-05T10:00:00Z"),
+            self._make_article("Old", "2025-01-01T10:00:00Z"),
+        ]
+        mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
+        result = get_news_data(["AAPL"], max_age_days=14)
+        titles = [r["title"] for r in result]
+        assert "Recent" in titles
+        assert "Old" not in titles
+
+    def test_deduplicates_titles(self, mocker):
+        mock_ticker = MagicMock()
+        mock_ticker.news = [
+            self._make_article("Same Title", "2026-03-05T10:00:00Z"),
+        ]
+        mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
+        result = get_news_data(["AAPL", "MSFT"])
+        assert len(result) == 1
+
+    def test_empty_news(self, mocker):
+        mock_ticker = MagicMock()
+        mock_ticker.news = []
+        mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
+        result = get_news_data(["AAPL"])
+        assert result == []
+
+    def test_limits_to_15(self, mocker):
+        mock_ticker = MagicMock()
+        mock_ticker.news = [
+            self._make_article(f"Article {i}", f"2026-03-{5+i % 5:02d}T10:00:00Z")
+            for i in range(20)
+        ]
+        mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
+        result = get_news_data(["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA"])
+        assert len(result) <= 15
+
+    def test_fallback_to_canonical_url(self, mocker):
+        mock_ticker = MagicMock()
+        mock_ticker.news = [{
+            "content": {
+                "title": "Test",
+                "pubDate": "2026-03-05T10:00:00Z",
+                "summary": "",
+                "provider": {"displayName": "Source"},
+                "clickThroughUrl": None,
+                "canonicalUrl": {"url": "https://canonical.example.com/test"},
+            }
+        }]
+        mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
+        result = get_news_data(["AAPL"])
+        assert result[0]["link"] == "https://canonical.example.com/test"
+
+    def test_handles_ticker_exception(self, mocker):
+        mocker.patch("stock.yf.Ticker", side_effect=Exception("API error"))
+        result = get_news_data(["AAPL"])
+        assert result == []
+
+    def test_sorted_newest_first(self, mocker):
+        mock_ticker = MagicMock()
+        mock_ticker.news = [
+            self._make_article("Older", "2026-03-01T10:00:00Z"),
+            self._make_article("Newer", "2026-03-08T10:00:00Z"),
+            self._make_article("Middle", "2026-03-05T10:00:00Z"),
+        ]
+        mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
+        result = get_news_data(["AAPL"])
+        assert result[0]["title"] == "Newer"
+        assert result[1]["title"] == "Middle"
+        assert result[2]["title"] == "Older"
+
+
+class TestBuildDisplayGroupNews:
+    def _summary(self, symbol="AAPL"):
+        return {
+            "symbol": symbol, "qty": 10, "val_now": 1500.0,
+            "val_prev": 1450.0, "chg_pct": 3.45, "daily_chg_val": 50.0,
+            "source_currency": "USD",
+        }
+
+    def test_news_panel_rendered(self):
+        news = [{
+            "symbol": "AAPL", "title": "Big News", "link": "https://example.com",
+            "provider": "Reuters", "pub_date": "2026-03-05 10:00", "summary": "A summary.",
+        }]
+        group = build_display_group([self._summary()], [], "USD", news_items=news)
+        output = _render(group)
+        assert "Related News" in output
+        assert "Big News" in output
+        assert "Reuters" in output
+        assert "A summary." in output
+
+    def test_no_news_panel_when_empty(self):
+        group = build_display_group([self._summary()], [], "USD", news_items=[])
+        output = _render(group)
+        assert "Related News" not in output
+
+    def test_long_summary_truncated(self):
+        news = [{
+            "symbol": "AAPL", "title": "Test", "link": "",
+            "provider": "Source", "pub_date": "2026-03-05 10:00",
+            "summary": "A " * 200,
+        }]
+        group = build_display_group([self._summary()], [], "USD", news_items=news)
+        output = _render(group)
+        assert "..." in output
 
 
 # ---------------------------------------------------------------------------

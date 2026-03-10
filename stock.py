@@ -252,6 +252,58 @@ def get_dividend_data(summary_data):
     return None
 
 
+def get_news_data(symbols, max_age_days=14):
+    news_items = []
+    seen_titles = set()
+    cutoff = datetime.now(ZoneInfo("UTC")) - pd.Timedelta(days=max_age_days)
+    for symbol in symbols:
+        try:
+            t = yf.Ticker(symbol)
+            articles = t.news or []
+            for article in articles[:3]:
+                content = article.get("content", {})
+                title = content.get("title", "")
+                if not title or title in seen_titles:
+                    continue
+                pub_date_raw = content.get("pubDate", "")
+                pub_dt = None
+                if pub_date_raw:
+                    try:
+                        pub_dt = datetime.fromisoformat(
+                            pub_date_raw.replace("Z", "+00:00")
+                        )
+                    except Exception:
+                        pass
+                if pub_dt and pub_dt < cutoff:
+                    continue
+                seen_titles.add(title)
+                link = ""
+                click_through = content.get("clickThroughUrl")
+                if click_through:
+                    link = click_through.get("url", "")
+                if not link:
+                    canonical = content.get("canonicalUrl")
+                    if canonical:
+                        link = canonical.get("url", "")
+                provider = content.get("provider", {}).get("displayName", "")
+                summary = content.get("summary", "")
+                pub_date_str = pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else pub_date_raw[:16]
+                news_items.append(
+                    {
+                        "symbol": symbol,
+                        "title": title,
+                        "link": link,
+                        "provider": provider,
+                        "pub_date": pub_date_str,
+                        "summary": summary,
+                    }
+                )
+        except Exception:
+            continue
+    news_items.sort(key=lambda x: x["pub_date"], reverse=True)
+    return news_items[:15]
+
+
 def render_sparkline(values):
 
     if not values or len(values) < 2:
@@ -350,6 +402,7 @@ def build_display_group(
     footer_text="",
     history_points=None,
     monthly_changes=None,
+    news_items=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     monthly_changes = monthly_changes or {}
@@ -473,12 +526,46 @@ def build_display_group(
             )
         summary_panel = Panel(summary_text, border_style="bright_blue", expand=False)
 
-    # 4. Footer
+    # 4. News Panel
+    news_panel = None
+    if news_items:
+        news_text = Text()
+        for i, item in enumerate(news_items):
+            if i > 0:
+                news_text.append("\n\n")
+            news_text.append(f"  {item['symbol']}", style="bold white")
+            news_text.append(f"  {item['pub_date']}", style="dim")
+            if item["provider"]:
+                news_text.append(f"  {item['provider']}", style="dim italic")
+            news_text.append("\n  ")
+            title_text = Text(item["title"])
+            if item["link"]:
+                title_text.stylize(f"link {item['link']}")
+                title_text.stylize("underline bright_cyan")
+            else:
+                title_text.stylize("bright_cyan")
+            news_text.append_text(title_text)
+            if item.get("summary"):
+                summary = item["summary"]
+                if len(summary) > 200:
+                    summary = summary[:200].rsplit(" ", 1)[0] + "..."
+                news_text.append(f"\n  {summary}", style="dim")
+        news_panel = Panel(
+            news_text,
+            title="Related News",
+            border_style="yellow",
+            expand=False,
+            padding=(1, 2),
+        )
+
+    # 5. Footer
     footer = Text(footer_text, style="dim italic") if footer_text else Text("")
 
     elements = [table]
     if div_table:
         elements.append(div_table)
+    if news_panel:
+        elements.append(news_panel)
     if summary_panel:
         elements.append(summary_panel)
     elements.append(footer)
@@ -519,10 +606,12 @@ def fetch_portfolio():
 
         summary_cache = {}
         dividend_cache = {}
+        news_cache = []
         history_points = []
         monthly_changes = {}
         last_history_update = 0
         last_dividend_update = 0
+        last_news_update = 0
         ticker_to_currency = {}
         rate_cache = {}
         last_update = "Initializing..."
@@ -581,6 +670,7 @@ def fetch_portfolio():
                                         f"Updating ({completed}/{num_holdings})...",
                                         history_points,
                                         monthly_changes,
+                                        news_cache,
                                     )
                                 )
                         except concurrent.futures.TimeoutError:
@@ -618,6 +708,10 @@ def fetch_portfolio():
                                     dividend_cache[symbol] = res
                         last_dividend_update = now
 
+                    if summary_cache and (now - last_news_update > 600 or not news_cache):
+                        news_cache = get_news_data(list(summary_cache.keys()))
+                        last_news_update = now
+
                     last_update = datetime.now().strftime("%H:%M:%S")
 
                     if not args.watch:
@@ -635,6 +729,7 @@ def fetch_portfolio():
                             msg,
                             history_points,
                             monthly_changes,
+                            news_cache,
                         )
                     )
 
@@ -672,6 +767,7 @@ def fetch_portfolio():
                     "",
                     history_points,
                     monthly_changes,
+                    news_cache,
                 )
             )
 
