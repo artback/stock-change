@@ -362,7 +362,7 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
         )
 
         if df.empty:
-            return [], {}, True
+            return [], {}, set()
 
         close_data = df["Close"]
         if isinstance(close_data, pd.Series):
@@ -422,13 +422,19 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
             if has_data:
                 history_totals.append(daily_total)
 
-        # Check if today is a trading day (any stock had data for today)
+        # Determine which tickers actually traded today (per-exchange
+        # holidays mean some may be open while others are closed).
         today = pd.Timestamp.now().normalize()
-        traded_today = bool(has_stock_data.get(today, False))
+        traded_today = set()
+        if today in close_data.index:
+            original_today = df["Close"].loc[today] if today in df["Close"].index else pd.Series(dtype=float)
+            for sym in symbols:
+                if sym in original_today.index and pd.notna(original_today[sym]):
+                    traded_today.add(sym)
 
         return history_totals, monthly_changes, traded_today
     except Exception:
-        return [], {}, True
+        return [], {}, set()
 
 
 def build_display_group(
@@ -727,11 +733,11 @@ def fetch_portfolio():
                             monthly_changes.update(new_monthly)
                         last_history_update = now
 
-                        # On non-trading days (bank holidays), zero out daily
-                        # changes — yfinance still reports the last session's
-                        # delta which is misleading.
-                        if not traded:
-                            for sym, data in summary_cache.items():
+                        # Zero out daily changes for tickers whose exchange
+                        # didn't trade today — yfinance still reports the last
+                        # session's delta which is misleading on holidays.
+                        for sym, data in summary_cache.items():
+                            if sym not in traded:
                                 data["chg_pct"] = 0
                                 data["daily_chg_val"] = 0
                                 data["val_prev"] = data["val_now"]

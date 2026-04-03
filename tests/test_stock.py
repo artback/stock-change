@@ -497,8 +497,8 @@ class TestFetchHistory:
         # Last total uses day 3 stock price (110) with day 3 rate (0.09)
         assert totals[-1] == pytest.approx(110.0 * 10 * 0.09)
 
-    def test_traded_today_false_on_holiday(self, mocker):
-        """traded_today should be False when today's date has no stock data."""
+    def test_traded_today_empty_on_holiday(self, mocker):
+        """traded_today should be empty when today's date has no stock data."""
         today = pd.Timestamp.now().normalize()
         yesterday = today - pd.Timedelta(days=1)
         dates = pd.DatetimeIndex([yesterday, today])
@@ -513,10 +513,10 @@ class TestFetchHistory:
         holdings = {"AAPL": 10}
         ticker_to_currency = {"AAPL": "USD"}
         totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
-        assert traded is False
+        assert traded == set()
 
-    def test_traded_today_true_on_normal_day(self, mocker):
-        """traded_today should be True when today's date has stock data."""
+    def test_traded_today_contains_tickers_with_data(self, mocker):
+        """traded_today should contain only tickers that had data today."""
         today = pd.Timestamp.now().normalize()
         yesterday = today - pd.Timedelta(days=1)
         dates = pd.DatetimeIndex([yesterday, today])
@@ -530,7 +530,29 @@ class TestFetchHistory:
         holdings = {"AAPL": 10}
         ticker_to_currency = {"AAPL": "USD"}
         totals, changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
-        assert traded is True
+        assert traded == {"AAPL"}
+
+    def test_partial_holiday_mixed_exchanges(self, mocker):
+        """On partial holidays (e.g. Good Friday), only tickers on open
+        exchanges should appear in traded_today."""
+        today = pd.Timestamp.now().normalize()
+        yesterday = today - pd.Timedelta(days=1)
+        dates = pd.DatetimeIndex([yesterday, today])
+        data = {
+            # Tokyo open on Good Friday
+            ("Close", "7203.T"): [2500.0, 2520.0],
+            # Stockholm closed
+            ("Close", "SVOL-B.ST"): [50.0, float("nan")],
+        }
+        mi_df = pd.DataFrame(data, index=dates)
+        mi_df.columns = pd.MultiIndex.from_tuples(mi_df.columns)
+        mocker.patch("yfinance.download", return_value=mi_df)
+
+        holdings = {"7203.T": 100, "SVOL-B.ST": 500}
+        ticker_to_currency = {"7203.T": "JPY", "SVOL-B.ST": "SEK"}
+        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        assert "7203.T" in traded
+        assert "SVOL-B.ST" not in traded
 
     def test_bfill_fixes_missing_rate_on_first_day(self, mocker):
         """Exchange rate NaN on the first row should be backfilled, not
