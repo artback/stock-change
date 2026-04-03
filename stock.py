@@ -121,6 +121,19 @@ def is_any_market_open(holdings, now=None):
     return False
 
 
+def _has_market_activity(summary_results):
+    """Detect if markets actually traded by checking for any price movement.
+
+    On bank holidays, lastPrice == regularMarketPreviousClose for all tickers
+    because no trades occurred. When combined with the schedule-based check in
+    is_any_market_open(), this reliably detects holidays without needing a
+    static calendar — it works for every local/regional holiday automatically.
+    """
+    if not summary_results:
+        return True  # Assume active when we have no data yet
+    return any(r.get("chg_pct", 0) != 0 for r in summary_results if r)
+
+
 def load_config(config_path=None):
     config_data = {"holdings": DEFAULT_HOLDINGS, "currency": "EUR"}
 
@@ -349,16 +362,31 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
         )
 
         if df.empty:
-            return [], {}
+            return [], {}, True
 
         close_data = df["Close"]
         if isinstance(close_data, pd.Series):
             sym = all_to_fetch[0]
             close_data = pd.DataFrame({sym: close_data})
 
-        # Forward-fill missing prices so days with partial data
-        # don't cause the portfolio total to drop artificially.
-        close_data = close_data.ffill()
+        # Identify rows where at least one stock had real trading data
+        # (before ffill) so we can exclude pure holiday rows where only
+        # forex pairs traded — stale prices + fresh rates skew totals.
+        stock_cols = [s for s in symbols if s in close_data.columns]
+        has_stock_data = (
+            close_data[stock_cols].notna().any(axis=1)
+            if stock_cols
+            else pd.Series(True, index=close_data.index)
+        )
+
+        # Forward-fill then back-fill: ffill handles gaps in the middle
+        # (partial holidays), bfill handles NaN at the start of the series
+        # (e.g. exchange rate pairs missing on the first trading day would
+        # otherwise fall back to rate=1.0 and massively inflate totals).
+        close_data = close_data.ffill().bfill()
+
+        # Drop rows with no stock data (e.g. bank holidays where only forex traded)
+        close_data = close_data[has_stock_data]
 
         # Calculate monthly change for each ticker
         monthly_changes = {}
@@ -394,9 +422,13 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
             if has_data:
                 history_totals.append(daily_total)
 
-        return history_totals, monthly_changes
+        # Check if today is a trading day (any stock had data for today)
+        today = pd.Timestamp.now().normalize()
+        traded_today = bool(has_stock_data.get(today, False))
+
+        return history_totals, monthly_changes, traded_today
     except Exception:
-        return [], {}
+        return [], {}, True
 
 
 def build_display_group(
@@ -686,7 +718,7 @@ def fetch_portfolio():
                     if ticker_to_currency and (
                         now - last_history_update > 120 or not history_points
                     ):
-                        new_history, new_monthly = fetch_history(
+                        new_history, new_monthly, traded = fetch_history(
                             holdings, target_currency, ticker_to_currency
                         )
                         if new_history:
@@ -694,6 +726,15 @@ def fetch_portfolio():
                         if new_monthly:
                             monthly_changes.update(new_monthly)
                         last_history_update = now
+
+                        # On non-trading days (bank holidays), zero out daily
+                        # changes — yfinance still reports the last session's
+                        # delta which is misleading.
+                        if not traded:
+                            for sym, data in summary_cache.items():
+                                data["chg_pct"] = 0
+                                data["daily_chg_val"] = 0
+                                data["val_prev"] = data["val_now"]
 
                     if summary_cache and (now - last_dividend_update > 600 or not dividend_cache):
                         with concurrent.futures.ThreadPoolExecutor(
@@ -721,7 +762,9 @@ def fetch_portfolio():
                     if not args.watch:
                         break
 
-                    market_open = is_any_market_open(holdings)
+                    market_open = is_any_market_open(holdings) and _has_market_activity(
+                        list(summary_cache.values())
+                    )
                     effective_interval = interval if market_open else max(interval, 300)
                     market_tag = "" if market_open else " | [Market Closed]"
                     msg = f"Last update: {last_update} | Next in {effective_interval}s{market_tag} | Ctrl+C to exit"
