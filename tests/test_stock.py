@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -13,6 +13,7 @@ from stock import (
     EXCHANGE_SCHEDULES,
     KNOWN_CURRENCIES,
     _get_exchange_suffix,
+    _has_market_activity,
     build_display_group,
     fetch_history,
     get_dividend_data,
@@ -425,7 +426,7 @@ class TestFetchHistory:
 
         holdings = {"AAPL": 10}
         ticker_to_currency = {"AAPL": "USD"}
-        totals, changes = fetch_history(holdings, "USD", ticker_to_currency)
+        totals, changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
 
         assert len(totals) == 3
         assert totals[0] == pytest.approx(1000.0)
@@ -435,13 +436,13 @@ class TestFetchHistory:
 
     def test_empty_download(self, mocker):
         mocker.patch("yfinance.download", return_value=pd.DataFrame())
-        totals, changes = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
+        totals, changes, traded = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
         assert totals == []
         assert changes == {}
 
     def test_exception_returns_empty(self, mocker):
         mocker.patch("yfinance.download", side_effect=Exception("network"))
-        totals, changes = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
+        totals, changes, traded = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
         assert totals == []
         assert changes == {}
 
@@ -457,7 +458,7 @@ class TestFetchHistory:
 
         holdings = {"TEST.ST": 10}
         ticker_to_currency = {"TEST.ST": "SEK"}
-        totals, changes = fetch_history(holdings, "EUR", ticker_to_currency)
+        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
         assert len(totals) == 3
         assert totals[0] == pytest.approx(100.0 * 10 * 0.09)
         assert totals[-1] == pytest.approx(120.0 * 10 * 0.10)
@@ -470,8 +471,107 @@ class TestFetchHistory:
 
         holdings = {"AAPL": 5}
         ticker_to_currency = {"AAPL": "USD"}
-        totals, changes = fetch_history(holdings, "USD", ticker_to_currency)
+        totals, changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
         assert len(totals) == 2
+
+    def test_holiday_row_with_only_forex_excluded(self, mocker):
+        """On bank holidays, forex trades but stocks don't. The holiday row
+        (stock=NaN, forex=fresh rate) should be excluded so stale prices
+        aren't paired with fresh exchange rates."""
+        dates = pd.date_range("2024-01-01", periods=4)
+        data = {
+            # Stock has data on days 1-3 but NaN on day 4 (holiday)
+            ("Close", "TEST.ST"): [100.0, 105.0, 110.0, float("nan")],
+            # Forex trades every day, rate drops on the holiday
+            ("Close", "SEKEUR=X"): [0.09, 0.09, 0.09, 0.08],
+        }
+        mi_df = pd.DataFrame(data, index=dates)
+        mi_df.columns = pd.MultiIndex.from_tuples(mi_df.columns)
+        mocker.patch("yfinance.download", return_value=mi_df)
+
+        holdings = {"TEST.ST": 10}
+        ticker_to_currency = {"TEST.ST": "SEK"}
+        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        # Holiday row should be excluded — only 3 trading days
+        assert len(totals) == 3
+        # Last total uses day 3 stock price (110) with day 3 rate (0.09)
+        assert totals[-1] == pytest.approx(110.0 * 10 * 0.09)
+
+    def test_traded_today_empty_on_holiday(self, mocker):
+        """traded_today should be empty when today's date has no stock data."""
+        today = pd.Timestamp.now().normalize()
+        yesterday = today - pd.Timedelta(days=1)
+        dates = pd.DatetimeIndex([yesterday, today])
+        data = {
+            ("Close", "AAPL"): [150.0, float("nan")],
+            ("Close", "USDEUR=X"): [0.87, 0.88],
+        }
+        mi_df = pd.DataFrame(data, index=dates)
+        mi_df.columns = pd.MultiIndex.from_tuples(mi_df.columns)
+        mocker.patch("yfinance.download", return_value=mi_df)
+
+        holdings = {"AAPL": 10}
+        ticker_to_currency = {"AAPL": "USD"}
+        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        assert traded == set()
+
+    def test_traded_today_contains_tickers_with_data(self, mocker):
+        """traded_today should contain only tickers that had data today."""
+        today = pd.Timestamp.now().normalize()
+        yesterday = today - pd.Timedelta(days=1)
+        dates = pd.DatetimeIndex([yesterday, today])
+        data = {
+            ("Close", "AAPL"): [150.0, 152.0],
+        }
+        mi_df = pd.DataFrame(data, index=dates)
+        mi_df.columns = pd.MultiIndex.from_tuples(mi_df.columns)
+        mocker.patch("yfinance.download", return_value=mi_df)
+
+        holdings = {"AAPL": 10}
+        ticker_to_currency = {"AAPL": "USD"}
+        totals, changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
+        assert traded == {"AAPL"}
+
+    def test_partial_holiday_mixed_exchanges(self, mocker):
+        """On partial holidays (e.g. Good Friday), only tickers on open
+        exchanges should appear in traded_today."""
+        today = pd.Timestamp.now().normalize()
+        yesterday = today - pd.Timedelta(days=1)
+        dates = pd.DatetimeIndex([yesterday, today])
+        data = {
+            # Tokyo open on Good Friday
+            ("Close", "7203.T"): [2500.0, 2520.0],
+            # Stockholm closed
+            ("Close", "SVOL-B.ST"): [50.0, float("nan")],
+        }
+        mi_df = pd.DataFrame(data, index=dates)
+        mi_df.columns = pd.MultiIndex.from_tuples(mi_df.columns)
+        mocker.patch("yfinance.download", return_value=mi_df)
+
+        holdings = {"7203.T": 100, "SVOL-B.ST": 500}
+        ticker_to_currency = {"7203.T": "JPY", "SVOL-B.ST": "SEK"}
+        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        assert "7203.T" in traded
+        assert "SVOL-B.ST" not in traded
+
+    def test_bfill_fixes_missing_rate_on_first_day(self, mocker):
+        """Exchange rate NaN on the first row should be backfilled, not
+        fall back to 1.0 which would massively inflate the portfolio."""
+        dates = pd.date_range("2024-01-01", periods=3)
+        data = {
+            ("Close", "TEST.ST"): [100.0, 105.0, 110.0],
+            ("Close", "SEKEUR=X"): [float("nan"), 0.09, 0.09],
+        }
+        mi_df = pd.DataFrame(data, index=dates)
+        mi_df.columns = pd.MultiIndex.from_tuples(mi_df.columns)
+        mocker.patch("yfinance.download", return_value=mi_df)
+
+        holdings = {"TEST.ST": 10}
+        ticker_to_currency = {"TEST.ST": "SEK"}
+        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        assert len(totals) == 3
+        # First day should use backfilled rate 0.09, not 1.0
+        assert totals[0] == pytest.approx(100.0 * 10 * 0.09)
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +680,12 @@ class TestBuildDisplayGroup:
 # ---------------------------------------------------------------------------
 
 class TestGetNewsData:
+    @staticmethod
+    def _recent_iso(days_ago=1):
+        """Return an ISO 8601 UTC timestamp for *days_ago* days before now."""
+        dt = datetime.now(ZoneInfo("UTC")) - timedelta(days=days_ago)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def _make_article(self, title, pub_date, provider="Test", summary="Some summary"):
         return {
             "content": {
@@ -595,7 +701,7 @@ class TestGetNewsData:
     def test_basic_fetch(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Breaking News", "2026-03-05T10:00:00Z"),
+            self._make_article("Breaking News", self._recent_iso(1)),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL"])
@@ -608,8 +714,8 @@ class TestGetNewsData:
     def test_filters_old_articles(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Recent", "2026-03-05T10:00:00Z"),
-            self._make_article("Old", "2025-01-01T10:00:00Z"),
+            self._make_article("Recent", self._recent_iso(1)),
+            self._make_article("Old", "2020-01-01T10:00:00Z"),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL"], max_age_days=14)
@@ -620,7 +726,7 @@ class TestGetNewsData:
     def test_deduplicates_titles(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Same Title", "2026-03-05T10:00:00Z"),
+            self._make_article("Same Title", self._recent_iso(1)),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL", "MSFT"])
@@ -636,7 +742,7 @@ class TestGetNewsData:
     def test_limits_to_15(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article(f"Article {i}", f"2026-03-{5+i % 5:02d}T10:00:00Z")
+            self._make_article(f"Article {i}", self._recent_iso(1 + i % 5))
             for i in range(20)
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
@@ -648,7 +754,7 @@ class TestGetNewsData:
         mock_ticker.news = [{
             "content": {
                 "title": "Test",
-                "pubDate": "2026-03-05T10:00:00Z",
+                "pubDate": self._recent_iso(1),
                 "summary": "",
                 "provider": {"displayName": "Source"},
                 "clickThroughUrl": None,
@@ -667,9 +773,9 @@ class TestGetNewsData:
     def test_sorted_newest_first(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Older", "2026-03-01T10:00:00Z"),
-            self._make_article("Newer", "2026-03-08T10:00:00Z"),
-            self._make_article("Middle", "2026-03-05T10:00:00Z"),
+            self._make_article("Older", self._recent_iso(7)),
+            self._make_article("Newer", self._recent_iso(1)),
+            self._make_article("Middle", self._recent_iso(3)),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL"])
@@ -717,6 +823,38 @@ class TestBuildDisplayGroupNews:
 # ---------------------------------------------------------------------------
 # Market status detection
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Holiday / market activity detection
+# ---------------------------------------------------------------------------
+
+class TestHasMarketActivity:
+    def test_no_data_assumes_active(self):
+        assert _has_market_activity([]) is True
+        assert _has_market_activity(None) is True
+
+    def test_all_zero_change_means_closed(self):
+        results = [
+            {"symbol": "AAPL", "chg_pct": 0},
+            {"symbol": "MSFT", "chg_pct": 0},
+        ]
+        assert _has_market_activity(results) is False
+
+    def test_any_nonzero_change_means_open(self):
+        results = [
+            {"symbol": "AAPL", "chg_pct": 0},
+            {"symbol": "MSFT", "chg_pct": 0.5},
+        ]
+        assert _has_market_activity(results) is True
+
+    def test_negative_change_means_open(self):
+        results = [{"symbol": "AAPL", "chg_pct": -1.2}]
+        assert _has_market_activity(results) is True
+
+    def test_none_entries_skipped(self):
+        results = [None, {"symbol": "AAPL", "chg_pct": 0}]
+        assert _has_market_activity(results) is False
+
 
 class TestGetExchangeSuffix:
     def test_stockholm(self):
