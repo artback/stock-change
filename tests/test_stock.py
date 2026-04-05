@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -680,6 +680,12 @@ class TestBuildDisplayGroup:
 # ---------------------------------------------------------------------------
 
 class TestGetNewsData:
+    @staticmethod
+    def _recent_iso(days_ago=1):
+        """Return an ISO 8601 UTC timestamp for *days_ago* days before now."""
+        dt = datetime.now(ZoneInfo("UTC")) - timedelta(days=days_ago)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def _make_article(self, title, pub_date, provider="Test", summary="Some summary"):
         return {
             "content": {
@@ -695,7 +701,7 @@ class TestGetNewsData:
     def test_basic_fetch(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Breaking News", "2026-03-05T10:00:00Z"),
+            self._make_article("Breaking News", self._recent_iso(1)),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL"])
@@ -708,8 +714,8 @@ class TestGetNewsData:
     def test_filters_old_articles(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Recent", "2026-03-05T10:00:00Z"),
-            self._make_article("Old", "2025-01-01T10:00:00Z"),
+            self._make_article("Recent", self._recent_iso(1)),
+            self._make_article("Old", "2020-01-01T10:00:00Z"),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL"], max_age_days=14)
@@ -720,7 +726,7 @@ class TestGetNewsData:
     def test_deduplicates_titles(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Same Title", "2026-03-05T10:00:00Z"),
+            self._make_article("Same Title", self._recent_iso(1)),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL", "MSFT"])
@@ -736,7 +742,7 @@ class TestGetNewsData:
     def test_limits_to_15(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article(f"Article {i}", f"2026-03-{5+i % 5:02d}T10:00:00Z")
+            self._make_article(f"Article {i}", self._recent_iso(1 + i % 5))
             for i in range(20)
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
@@ -748,7 +754,7 @@ class TestGetNewsData:
         mock_ticker.news = [{
             "content": {
                 "title": "Test",
-                "pubDate": "2026-03-05T10:00:00Z",
+                "pubDate": self._recent_iso(1),
                 "summary": "",
                 "provider": {"displayName": "Source"},
                 "clickThroughUrl": None,
@@ -767,9 +773,9 @@ class TestGetNewsData:
     def test_sorted_newest_first(self, mocker):
         mock_ticker = MagicMock()
         mock_ticker.news = [
-            self._make_article("Older", "2026-03-01T10:00:00Z"),
-            self._make_article("Newer", "2026-03-08T10:00:00Z"),
-            self._make_article("Middle", "2026-03-05T10:00:00Z"),
+            self._make_article("Older", self._recent_iso(7)),
+            self._make_article("Newer", self._recent_iso(1)),
+            self._make_article("Middle", self._recent_iso(3)),
         ]
         mocker.patch("stock.yf.Ticker", return_value=mock_ticker)
         result = get_news_data(["AAPL"])
