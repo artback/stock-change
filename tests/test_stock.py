@@ -249,6 +249,27 @@ class TestGetTickerSummary:
         assert result is not None
         assert result["chg_pct"] == pytest.approx((55.5 - 54.3) / 54.3 * 100)
 
+    def test_history_preferred_over_bogus_previous_close(self, mocker):
+        """When regularMarketPreviousClose is missing, fast_info.previousClose
+        sometimes mirrors lastPrice (which would zero the day change). Daily
+        history must win so the real prior-session close is used."""
+        dates = pd.DatetimeIndex(
+            [pd.Timestamp.now().normalize() - pd.Timedelta(days=1)]
+        )
+        hist = pd.DataFrame({"Close": [54.3]}, index=dates)
+        mock = MagicMock()
+        mock.fast_info = {
+            "lastPrice": 55.25,
+            "regularMarketPreviousClose": float("nan"),
+            "previousClose": 55.25,  # bogus — equals lastPrice
+            "currency": "SEK",
+        }
+        mock.history.return_value = hist
+        mocker.patch("yfinance.Ticker", return_value=mock)
+        result = get_ticker_summary("SVOL-B.ST", 100, "SEK", {})
+        assert result is not None
+        assert result["chg_pct"] == pytest.approx((55.25 - 54.3) / 54.3 * 100)
+
     def test_nan_price_returns_none(self, mocker):
         fi = {
             "lastPrice": float("nan"),

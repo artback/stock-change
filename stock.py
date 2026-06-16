@@ -230,11 +230,15 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache):
         t = yf.Ticker(symbol)
         fi = t.fast_info
         price = fi.get("lastPrice")
+        # regularMarketPreviousClose is the authoritative prior-session close.
+        # When it's missing, prefer daily history over fast_info's previousClose
+        # — the latter is unreliable and sometimes mirrors today's lastPrice
+        # (which would collapse the daily change to 0).
         prev_close = fi.get("regularMarketPreviousClose")
         if prev_close is None or pd.isna(prev_close):
-            prev_close = fi.get("previousClose")
-        if prev_close is None or pd.isna(prev_close):
             prev_close = _previous_close_from_history(t)
+        if prev_close is None or pd.isna(prev_close):
+            prev_close = fi.get("previousClose")
         source_currency = fi.get("currency", "USD")
         conv = get_rate(source_currency, target_currency, rate_cache)
 
