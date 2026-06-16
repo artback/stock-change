@@ -1,3 +1,4 @@
+import time
 from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
@@ -14,17 +15,22 @@ from stock import (
     KNOWN_CURRENCIES,
     _get_exchange_suffix,
     _has_market_activity,
+    _retry,
     apply_holiday_zeroing,
     build_display_group,
     fetch_all_dividends,
+    fetch_auxiliary,
     fetch_history,
+    fetch_summaries,
     get_dividend_data,
     get_news_data,
     get_rate,
     get_ticker_summary,
     is_any_market_open,
+    load_cached_portfolio,
     load_config,
     render_sparkline,
+    save_cached_portfolio,
     validate_currency,
 )
 
@@ -131,9 +137,15 @@ class TestValidateCurrency:
         mocker.patch("yfinance.Ticker", return_value=mock_ticker)
         assert validate_currency("QQQ") is False
 
-    def test_api_exception_returns_false(self, mocker):
+    def test_api_exception_is_tolerated_offline(self, mocker):
+        # Can't verify an unknown code without network — be lenient and allow
+        # a plausibly valid (alphabetic, 3-char) code rather than refuse to run.
         mocker.patch("yfinance.Ticker", side_effect=Exception("network"))
-        assert validate_currency("QQQ") is False
+        assert validate_currency("XYZ") is True
+
+    def test_non_alpha_code_is_invalid(self):
+        assert validate_currency("12X") is False
+        assert validate_currency("E1R") is False
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +294,51 @@ class TestGetTickerSummary:
         assert get_ticker_summary("BAD", 1, "USD", {}) is None
 
     def test_exception_returns_none(self, mocker):
+        mocker.patch("stock.time.sleep")  # don't actually back off in tests
         mocker.patch("yfinance.Ticker", side_effect=Exception("network"))
         assert get_ticker_summary("FAIL", 1, "USD", {}) is None
+
+    def test_retries_then_succeeds(self, mocker):
+        mocker.patch("stock.time.sleep")
+        good = MagicMock()
+        good.fast_info = {"lastPrice": 150.0, "regularMarketPreviousClose": 145.0}
+        # First two calls fail, third returns a working ticker.
+        mocker.patch(
+            "yfinance.Ticker",
+            side_effect=[Exception("429"), Exception("429"), good],
+        )
+        result = get_ticker_summary("AAPL", 10, "USD", {})
+        assert result is not None
+        assert result["chg_pct"] == pytest.approx((150 - 145) / 145 * 100)
+
+
+# ---------------------------------------------------------------------------
+# _retry
+# ---------------------------------------------------------------------------
+
+
+class TestRetry:
+    def test_returns_first_success(self):
+        calls = {"n": 0}
+
+        def fn():
+            calls["n"] += 1
+            return "ok"
+
+        assert _retry(fn) == "ok"
+        assert calls["n"] == 1
+
+    def test_retries_then_raises(self, mocker):
+        mocker.patch("stock.time.sleep")
+        calls = {"n": 0}
+
+        def fn():
+            calls["n"] += 1
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError):
+            _retry(fn, attempts=3)
+        assert calls["n"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +1038,8 @@ class TestIsAnyMarketOpen:
             assert suffix in EXCHANGE_SCHEDULES
 
     def test_default_schedule_is_nyse(self):
-        assert DEFAULT_SCHEDULE == ("America/New_York", 9, 16)
+        # NYSE/Nasdaq regular session is 09:30–16:00 Eastern.
+        assert DEFAULT_SCHEDULE == ("America/New_York", 9.5, 16)
 
 
 # ---------------------------------------------------------------------------
@@ -1058,3 +1114,178 @@ class TestFetchAllDividends:
         result = fetch_all_dividends(summary_values)
         assert set(result) == {"INVE-B.ST"}
         assert result["INVE-B.ST"]["amt"] == 1.6
+
+
+# ---------------------------------------------------------------------------
+# fetch_summaries
+# ---------------------------------------------------------------------------
+
+
+class TestFetchSummaries:
+    def test_collects_and_reports_failures(self, mocker):
+        def fake(symbol, qty, currency, rate_cache, prev_close_cache=None):
+            if symbol == "BAD":
+                return None
+            return {"symbol": symbol, "source_currency": "USD", "val_now": qty}
+
+        mocker.patch("stock.get_ticker_summary", side_effect=fake)
+        summaries, ttc, failed = fetch_summaries(
+            {"AAPL": 1, "BAD": 2, "MSFT": 3}, "USD", {}
+        )
+        assert set(summaries) == {"AAPL", "MSFT"}
+        assert ttc == {"AAPL": "USD", "MSFT": "USD"}
+        assert failed == ["BAD"]
+
+    def test_empty_holdings(self):
+        summaries, ttc, failed = fetch_summaries({}, "USD", {})
+        assert summaries == {} and ttc == {} and failed == []
+
+    def test_progress_callback_invoked(self, mocker):
+        mocker.patch(
+            "stock.get_ticker_summary",
+            side_effect=lambda s, q, c, rc, pc=None: {
+                "symbol": s,
+                "source_currency": "USD",
+            },
+        )
+        seen = []
+        fetch_summaries(
+            {"AAPL": 1, "MSFT": 1}, "USD", {}, on_progress=lambda c, t, p: seen.append((c, t))
+        )
+        assert seen[-1] == (2, 2)
+
+    def test_future_exception_counts_as_failed(self, mocker):
+        mocker.patch("stock.get_ticker_summary", side_effect=Exception("boom"))
+        summaries, ttc, failed = fetch_summaries({"AAPL": 1}, "USD", {})
+        assert summaries == {}
+        assert failed == ["AAPL"]
+
+
+# ---------------------------------------------------------------------------
+# fetch_auxiliary
+# ---------------------------------------------------------------------------
+
+
+class TestFetchAuxiliary:
+    def test_only_requested_sections_run(self, mocker):
+        hist = mocker.patch("stock.fetch_history", return_value=([1.0], {"A": 2.0}, {"A"}))
+        divs = mocker.patch("stock.fetch_all_dividends", return_value={"A": {"x": 1}})
+        news = mocker.patch("stock.get_news_data", return_value=[{"t": 1}])
+
+        result = fetch_auxiliary(
+            {"A": 1}, "USD", {"A": {"symbol": "A"}}, {"A": "USD"},
+            want_history=True, want_dividends=False, want_news=False,
+        )
+        assert result["history"] == [1.0]
+        assert result["monthly"] == {"A": 2.0}
+        assert result["traded"] == {"A"}
+        assert "dividends" not in result and "news" not in result
+        hist.assert_called_once()
+        divs.assert_not_called()
+        news.assert_not_called()
+
+    def test_all_sections(self, mocker):
+        mocker.patch("stock.fetch_history", return_value=([1.0], {}, set()))
+        mocker.patch("stock.fetch_all_dividends", return_value={"A": 1})
+        mocker.patch("stock.get_news_data", return_value=["n"])
+        result = fetch_auxiliary(
+            {"A": 1}, "USD", {}, {},
+            want_history=True, want_dividends=True, want_news=True,
+        )
+        assert set(result) == {"history", "monthly", "traded", "dividends", "news"}
+
+
+# ---------------------------------------------------------------------------
+# portfolio cache
+# ---------------------------------------------------------------------------
+
+
+class TestPortfolioCache:
+    def test_roundtrip_within_ttl(self, tmp_path):
+        path = tmp_path / "cache.json"
+        holdings = {"AAPL": 10}
+        summaries = [
+            {
+                "symbol": "AAPL",
+                "qty": 10,
+                "val_now": 1500.0,
+                "val_prev": 1450.0,
+                "chg_pct": 3.4,
+                "daily_chg_val": 50.0,
+                "source_currency": "USD",
+                "conv": 1.0,
+                "ticker_obj": object(),  # non-serialisable, must be dropped
+            }
+        ]
+        save_cached_portfolio(holdings, "USD", summaries, [], [], [1.0, 2.0], {"AAPL": 5.0}, path=path)
+        cached = load_cached_portfolio(holdings, "USD", ttl=60, path=path)
+        assert cached is not None
+        assert cached["summaries"][0]["symbol"] == "AAPL"
+        assert "ticker_obj" not in cached["summaries"][0]
+        assert cached["history_points"] == [1.0, 2.0]
+
+    def test_disabled_when_ttl_zero(self, tmp_path):
+        path = tmp_path / "cache.json"
+        save_cached_portfolio({"AAPL": 1}, "USD", [], [], [], [], {}, path=path)
+        assert load_cached_portfolio({"AAPL": 1}, "USD", ttl=0, path=path) is None
+
+    def test_miss_on_different_holdings(self, tmp_path):
+        path = tmp_path / "cache.json"
+        save_cached_portfolio({"AAPL": 1}, "USD", [], [], [], [], {}, path=path)
+        assert load_cached_portfolio({"MSFT": 1}, "USD", ttl=60, path=path) is None
+
+    def test_expired_returns_none(self, tmp_path, mocker):
+        path = tmp_path / "cache.json"
+        save_cached_portfolio({"AAPL": 1}, "USD", [], [], [], [], {}, path=path)
+        # Pretend the snapshot is two minutes old.
+        real = time.time()
+        mocker.patch("stock.time.time", return_value=real + 120)
+        assert load_cached_portfolio({"AAPL": 1}, "USD", ttl=60, path=path) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert load_cached_portfolio({"AAPL": 1}, "USD", ttl=60, path=tmp_path / "nope.json") is None
+
+
+# ---------------------------------------------------------------------------
+# build_display_group error indicators
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDisplayErrors:
+    def _summary(self, symbol="AAPL"):
+        return {
+            "symbol": symbol,
+            "qty": 10,
+            "val_now": 1500.0,
+            "val_prev": 1450.0,
+            "chg_pct": 3.4,
+            "daily_chg_val": 50.0,
+        }
+
+    def _render(self, group):
+        console = Console(width=120, record=True)
+        with console.capture() as cap:
+            console.print(group)
+        return cap.get()
+
+    def test_never_loaded_symbol_shows_error_row(self):
+        group = build_display_group(
+            [], [], "USD", error_symbols={"FAIL"}, holdings={"FAIL": 7}
+        )
+        out = self._render(group)
+        assert "FAIL" in out
+        assert "error" in out
+
+    def test_stale_symbol_is_marked(self):
+        group = build_display_group(
+            [self._summary("AAPL")], [], "USD",
+            error_symbols={"AAPL"}, holdings={"AAPL": 10},
+        )
+        out = self._render(group)
+        assert "AAPL" in out
+        assert "⚠" in out
+
+    def test_no_errors_no_marker(self):
+        group = build_display_group([self._summary("AAPL")], [], "USD")
+        out = self._render(group)
+        assert "⚠" not in out
