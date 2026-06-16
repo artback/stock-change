@@ -67,9 +67,21 @@ stock-price --config ./my_stocks.yaml
 export STOCK_PRICE_CONFIG="./my_stocks.yaml"
 stock-price
 
-# Live watch mode (updates every 5 seconds)
+# Live watch mode (auto-refresh; throttles to 5 min when markets are closed)
 stock-price --watch
+
+# Set the refresh interval (seconds) in watch mode
+stock-price --watch --interval 15
+
+# Speed up repeated one-shot runs by reusing a recent snapshot (seconds).
+# Also settable via the STOCK_PRICE_CACHE_TTL environment variable.
+stock-price --cache-ttl 60
 ```
+
+Tickers that fail to load (network/rate-limit errors or invalid symbols) are
+retried with backoff and, if still unavailable, shown as a stale `⚠` / `error`
+row rather than silently disappearing — so the portfolio total is never quietly
+wrong.
 
 ## Maintenance
 

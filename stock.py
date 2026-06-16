@@ -3,6 +3,7 @@ import yfinance as yf
 import logging
 import yaml
 import time
+import json
 import argparse
 import concurrent.futures
 import sys
@@ -61,32 +62,36 @@ CURRENCY_SYMBOLS = {
 }
 
 
+# (timezone, open, close) as fractional local hours — e.g. 17.5 == 17:30.
+# Times are continuous-session approximations; intraday lunch breaks (e.g.
+# Tokyo) are not modelled. Used only to pick the refresh cadence and the
+# "Market Closed" tag, so half-hour precision is plenty.
 EXCHANGE_SCHEDULES = {
-    ".ST": ("Europe/Stockholm", 9, 17),
-    ".HE": ("Europe/Helsinki", 10, 18),
+    ".ST": ("Europe/Stockholm", 9, 17.5),
+    ".HE": ("Europe/Helsinki", 10, 18.5),
     ".CO": ("Europe/Copenhagen", 9, 17),
-    ".OL": ("Europe/Oslo", 9, 16),
-    ".PA": ("Europe/Paris", 9, 17),
-    ".DE": ("Europe/Berlin", 9, 17),
-    ".AS": ("Europe/Amsterdam", 9, 17),
-    ".BR": ("Europe/Brussels", 9, 17),
-    ".MI": ("Europe/Rome", 9, 17),
-    ".MC": ("Europe/Madrid", 9, 17),
-    ".SW": ("Europe/Zurich", 9, 17),
-    ".VI": ("Europe/Vienna", 9, 17),
-    ".L": ("Europe/London", 8, 16),
-    ".LS": ("Europe/Lisbon", 8, 16),
+    ".OL": ("Europe/Oslo", 9, 16.5),
+    ".PA": ("Europe/Paris", 9, 17.5),
+    ".DE": ("Europe/Berlin", 9, 17.5),
+    ".AS": ("Europe/Amsterdam", 9, 17.5),
+    ".BR": ("Europe/Brussels", 9, 17.5),
+    ".MI": ("Europe/Rome", 9, 17.5),
+    ".MC": ("Europe/Madrid", 9, 17.5),
+    ".SW": ("Europe/Zurich", 9, 17.5),
+    ".VI": ("Europe/Vienna", 9, 17.5),
+    ".L": ("Europe/London", 8, 16.5),
+    ".LS": ("Europe/Lisbon", 8, 16.5),
     ".T": ("Asia/Tokyo", 9, 15),
-    ".HK": ("Asia/Hong_Kong", 9, 16),
+    ".HK": ("Asia/Hong_Kong", 9.5, 16),
     ".SI": ("Asia/Singapore", 9, 17),
     ".AX": ("Australia/Sydney", 10, 16),
-    ".NZ": ("Pacific/Auckland", 10, 16),
-    ".TO": ("America/Toronto", 9, 16),
+    ".NZ": ("Pacific/Auckland", 10, 16.75),
+    ".TO": ("America/Toronto", 9.5, 16),
     ".SA": ("America/Sao_Paulo", 10, 17),
-    ".MX": ("America/Mexico_City", 8, 15),
+    ".MX": ("America/Mexico_City", 8.5, 15),
 }
 
-DEFAULT_SCHEDULE = ("America/New_York", 9, 16)
+DEFAULT_SCHEDULE = ("America/New_York", 9.5, 16)
 
 
 def _get_exchange_suffix(symbol):
@@ -115,7 +120,8 @@ def is_any_market_open(holdings, now=None):
     for tz_name, open_hour, close_hour in schedules:
         tz = ZoneInfo(tz_name)
         local_now = now.astimezone(tz)
-        if local_now.weekday() < 5 and open_hour <= local_now.hour < close_hour:
+        local_hour = local_now.hour + local_now.minute / 60
+        if local_now.weekday() < 5 and open_hour <= local_hour < close_hour:
             return True
 
     return False
@@ -171,13 +177,32 @@ def validate_currency(currency_code):
         return False
     if currency_code in KNOWN_CURRENCIES:
         return True
+    if not currency_code.isalpha():
+        return False
     try:
         ticker = yf.Ticker(f"USD{currency_code}=X")
-        if ticker.fast_info.get("lastPrice"):
-            return True
+        # A successful lookup with no price means the code is genuinely invalid.
+        return bool(ticker.fast_info.get("lastPrice"))
     except Exception:
-        pass
-    return False
+        # Couldn't verify (e.g. offline). Don't block a plausibly valid code —
+        # better to attempt the run than to refuse to start with no network.
+        return True
+
+
+def _retry(fn, attempts=3, base_delay=0.4):
+    """Call ``fn`` and retry transient failures with exponential backoff.
+
+    yfinance regularly returns rate-limit (HTTP 429) and transient network
+    errors; a couple of short retries turn most of those into a successful
+    fetch instead of a ticker that silently drops out of the table.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(base_delay * (2**attempt))
 
 
 def get_rate(source, target, cache):
@@ -225,18 +250,37 @@ def _previous_close_from_history(ticker):
         return None
 
 
-def get_ticker_summary(symbol, qty, target_currency, rate_cache):
+def _cached_previous_close(symbol, ticker, cache):
+    """Previous-session close from daily history, cached per symbol.
+
+    The prior session's close is stable for the whole trading day, so caching
+    it avoids a redundant per-ticker history download on every watch refresh.
+    """
+    if cache is not None and symbol in cache:
+        return cache[symbol]
+    value = _previous_close_from_history(ticker)
+    if cache is not None and value is not None:
+        cache[symbol] = value
+    return value
+
+
+def get_ticker_summary(symbol, qty, target_currency, rate_cache, prev_close_cache=None):
     try:
-        t = yf.Ticker(symbol)
-        fi = t.fast_info
-        price = fi.get("lastPrice")
+        def _fetch():
+            t = yf.Ticker(symbol)
+            fi = t.fast_info
+            # Touch lastPrice so the network fetch (and any 429) happens here,
+            # inside the retry, rather than lazily later.
+            return t, fi, fi.get("lastPrice")
+
+        t, fi, price = _retry(_fetch)
         # regularMarketPreviousClose is the authoritative prior-session close.
         # When it's missing, prefer daily history over fast_info's previousClose
         # — the latter is unreliable and sometimes mirrors today's lastPrice
         # (which would collapse the daily change to 0).
         prev_close = fi.get("regularMarketPreviousClose")
         if prev_close is None or pd.isna(prev_close):
-            prev_close = _previous_close_from_history(t)
+            prev_close = _cached_previous_close(symbol, t, prev_close_cache)
         if prev_close is None or pd.isna(prev_close):
             prev_close = fi.get("previousClose")
         source_currency = fi.get("currency", "USD")
@@ -505,31 +549,211 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
             if has_data:
                 history_totals.append(daily_total)
 
-        # Determine which exchanges actually traded today. Per-exchange
-        # holidays mean some may be open while others are closed, but all
-        # tickers on one exchange share a calendar — so we decide per
-        # exchange, not per ticker. yfinance's daily bar for the in-progress
-        # session lags for some tickers, so requiring every ticker to have a
-        # today bar would wrongly flag live tickers as untraded (and the
-        # watch loop would zero out their real fast_info day change).
-        today = pd.Timestamp.now().normalize()
-        original_today = (
-            df["Close"].loc[today]
-            if today in df["Close"].index
-            else pd.Series(dtype=float)
-        )
-        traded_suffixes = {
-            _get_exchange_suffix(sym)
-            for sym in symbols
-            if sym in original_today.index and pd.notna(original_today[sym])
-        }
-        traded_today = {
-            sym for sym in symbols if _get_exchange_suffix(sym) in traded_suffixes
-        }
+        # Determine which exchanges actually traded today. Per-exchange holidays
+        # mean some may be open while others are closed, but all tickers on one
+        # exchange share a calendar — so we decide per exchange, not per ticker
+        # (yfinance's daily bar lags for some tickers in the live session).
+        #
+        # Anchor on the download's own latest session rather than a machine-local
+        # "today": comparing a local timestamp against the tz-naive daily index
+        # is off-by-a-day when running far from the holdings' exchanges. The
+        # latest bar only counts as "today" if it matches the current date in
+        # local OR UTC time (so weekends/holidays, where the latest bar is an
+        # earlier session, correctly yield no traded exchanges).
+        close_raw = df["Close"]
+        today_dates = {pd.Timestamp.now().date(), pd.Timestamp.now(tz="UTC").date()}
+        traded_today = set()
+        if isinstance(close_raw, pd.Series):
+            # Single-ticker download: columns aren't keyed by symbol.
+            if len(close_raw.index):
+                latest = close_raw.index.max()
+                if latest.date() in today_dates and pd.notna(close_raw.loc[latest]):
+                    traded_today = set(symbols)
+        elif len(close_raw.index):
+            latest = close_raw.index.max()
+            if latest.date() in today_dates:
+                latest_row = close_raw.loc[latest]
+                traded_suffixes = {
+                    _get_exchange_suffix(sym)
+                    for sym in symbols
+                    if sym in latest_row.index and pd.notna(latest_row[sym])
+                }
+                traded_today = {
+                    sym
+                    for sym in symbols
+                    if _get_exchange_suffix(sym) in traded_suffixes
+                }
 
         return history_totals, monthly_changes, traded_today
     except Exception:
         return [], {}, set()
+
+
+def fetch_summaries(
+    holdings,
+    target_currency,
+    rate_cache,
+    prev_close_cache=None,
+    on_progress=None,
+    timeout=15,
+):
+    """Fetch per-ticker summaries concurrently.
+
+    Returns ``(summaries, ticker_to_currency, failed)`` where ``summaries``
+    maps symbol -> summary dict and ``failed`` lists symbols that errored or
+    returned no data (so the caller can flag them instead of silently dropping
+    them). ``on_progress(completed, total, summaries)`` is called as each
+    result arrives, to drive a live progress display.
+    """
+    summaries = {}
+    ticker_to_currency = {}
+    total = len(holdings)
+    if total == 0:
+        return summaries, ticker_to_currency, []
+
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=total) as executor:
+        future_to_symbol = {
+            executor.submit(
+                get_ticker_summary,
+                s,
+                q,
+                target_currency,
+                rate_cache,
+                prev_close_cache,
+            ): s
+            for s, q in holdings.items()
+        }
+        try:
+            for future in concurrent.futures.as_completed(
+                future_to_symbol, timeout=timeout
+            ):
+                symbol = future_to_symbol[future]
+                completed += 1
+                try:
+                    res = future.result()
+                except Exception:
+                    res = None
+                if res:
+                    summaries[symbol] = res
+                    ticker_to_currency[symbol] = res["source_currency"]
+                if on_progress:
+                    on_progress(completed, total, summaries)
+        except concurrent.futures.TimeoutError:
+            pass
+
+    failed = [s for s in holdings if s not in summaries]
+    return summaries, ticker_to_currency, failed
+
+
+def fetch_auxiliary(
+    holdings,
+    target_currency,
+    summaries,
+    ticker_to_currency,
+    *,
+    want_history=False,
+    want_dividends=False,
+    want_news=False,
+):
+    """Refresh whichever of history/dividends/news are requested, concurrently.
+
+    Returns a dict with keys ``history``/``monthly``/``traded`` (when history
+    was requested), ``dividends`` and ``news`` — present only for the sections
+    that were requested. They only read the summary/holdings, so running them
+    together avoids serialising independent network round-trips.
+    """
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        hist_future = (
+            pool.submit(fetch_history, holdings, target_currency, ticker_to_currency)
+            if want_history
+            else None
+        )
+        div_future = (
+            pool.submit(fetch_all_dividends, list(summaries.values()))
+            if want_dividends
+            else None
+        )
+        news_future = (
+            pool.submit(get_news_data, list(summaries.keys()))
+            if want_news
+            else None
+        )
+
+        if hist_future is not None:
+            history, monthly, traded = hist_future.result()
+            result["history"] = history
+            result["monthly"] = monthly
+            result["traded"] = traded
+        if div_future is not None:
+            result["dividends"] = div_future.result()
+        if news_future is not None:
+            result["news"] = news_future.result()
+    return result
+
+
+CACHE_PATH = Path.home() / ".stock_price_cache.json"
+
+_CACHED_SUMMARY_FIELDS = (
+    "symbol",
+    "qty",
+    "val_now",
+    "val_prev",
+    "chg_pct",
+    "daily_chg_val",
+    "source_currency",
+    "conv",
+)
+
+
+def _cache_key(holdings, currency):
+    return f"{currency}:" + ",".join(f"{k}={v}" for k, v in sorted(holdings.items()))
+
+
+def load_cached_portfolio(holdings, currency, ttl, path=CACHE_PATH):
+    """Return a fresh cached snapshot for this portfolio, or None.
+
+    Used to make repeated one-shot invocations instant. Disabled when
+    ``ttl <= 0``. The snapshot is only returned if it matches the same
+    holdings/currency and is younger than ``ttl`` seconds.
+    """
+    if ttl <= 0:
+        return None
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return None
+    if data.get("key") != _cache_key(holdings, currency):
+        return None
+    age = time.time() - data.get("timestamp", 0)
+    if age < 0 or age > ttl:
+        return None
+    data["age"] = age
+    return data
+
+
+def save_cached_portfolio(
+    holdings, currency, summaries, dividends, news, history_points, monthly_changes,
+    path=CACHE_PATH,
+):
+    """Persist a portfolio snapshot for fast repeated runs. Best-effort."""
+    try:
+        payload = {
+            "key": _cache_key(holdings, currency),
+            "timestamp": time.time(),
+            "summaries": [
+                {f: s[f] for f in _CACHED_SUMMARY_FIELDS if f in s}
+                for s in summaries
+            ],
+            "dividends": [{**d, "ex_date": str(d["ex_date"])} for d in dividends],
+            "news": news,
+            "history_points": history_points,
+            "monthly_changes": monthly_changes,
+        }
+        Path(path).write_text(json.dumps(payload))
+    except Exception:
+        pass
 
 
 def build_display_group(
@@ -540,9 +764,12 @@ def build_display_group(
     history_points=None,
     monthly_changes=None,
     news_items=None,
+    error_symbols=None,
+    holdings=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     monthly_changes = monthly_changes or {}
+    error_symbols = set(error_symbols or ())
 
     # 1. Summary Table (No expand=True to keep it compact)
     table = Table(
@@ -588,8 +815,15 @@ def build_display_group(
             else Text("-", style="dim")
         )
 
+        # Flag a ticker whose latest refresh failed — its row is still shown
+        # (last-good values) but marked stale so the total isn't silently wrong.
+        if s["symbol"] in error_symbols:
+            ticker_cell = Text(f"{s['symbol']} ⚠", style="yellow")
+        else:
+            ticker_cell = s["symbol"]
+
         table.add_row(
-            s["symbol"],
+            ticker_cell,
             f"{s['qty']:,}",
             f"{val_now:,.2f} {target_symbol}" if not pd.isna(val_now) else "-",
             Text(
@@ -602,6 +836,21 @@ def build_display_group(
             if not pd.isna(chg_pct)
             else Text("-", style="dim"),
             m_text,
+        )
+
+    # Tickers that have never loaded (no cached data at all) would otherwise
+    # vanish entirely — show them explicitly as errored so a partial portfolio
+    # can't be mistaken for the whole.
+    loaded = {s["symbol"] for s in summary_results}
+    for sym in sorted(error_symbols - loaded):
+        qty = (holdings or {}).get(sym)
+        table.add_row(
+            Text(f"{sym} ⚠", style="red"),
+            f"{qty:,}" if isinstance(qty, (int, float)) else "",
+            Text("error", style="dim red"),
+            Text("-", style="dim"),
+            Text("-", style="dim"),
+            Text("-", style="dim"),
         )
 
     if summary_results:
@@ -723,6 +972,13 @@ def fetch_portfolio():
         "-i", "--interval", type=int, default=30, help="Watch mode refresh interval in seconds (default: 30)"
     )
     parser.add_argument("--config", help="Path to a custom YAML configuration file")
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        default=int(os.environ.get("STOCK_PRICE_CACHE_TTL", "0")),
+        help="Reuse cached results younger than N seconds for instant repeat "
+        "runs (0 = disabled; one-shot mode only)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -741,6 +997,24 @@ def fetch_portfolio():
             )
             sys.exit(1)
 
+        # Instant repeat runs: render a fresh-enough cached snapshot and exit.
+        if not args.watch:
+            cached = load_cached_portfolio(holdings, target_currency, args.cache_ttl)
+            if cached:
+                age = int(cached.get("age", 0))
+                console.print(
+                    build_display_group(
+                        cached.get("summaries", []),
+                        cached.get("dividends", []),
+                        target_currency,
+                        f"(cached {age}s ago — run again for fresh data)",
+                        cached.get("history_points", []),
+                        cached.get("monthly_changes", {}),
+                        cached.get("news", []),
+                    )
+                )
+                return
+
         summary_cache = {}
         dividend_cache = {}
         news_cache = []
@@ -750,8 +1024,10 @@ def fetch_portfolio():
         last_dividend_update = 0
         last_news_update = 0
         traded_symbols = None
+        failed_symbols = []
         ticker_to_currency = {}
         rate_cache = {}
+        prev_close_cache = {}
         last_update = "Initializing..."
         interval = max(5, args.interval)
 
@@ -777,117 +1053,112 @@ def fetch_portfolio():
 
             try:
                 while True:
-                    # Fetch data
-                    num_holdings = len(holdings)
-                    completed = 0
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=max(1, num_holdings)
-                    ) as executor:
-                        future_to_symbol = {
-                            executor.submit(
-                                get_ticker_summary, s, q, target_currency, rate_cache
-                            ): s
-                            for s, q in holdings.items()
-                        }
-                        try:
-                            for future in concurrent.futures.as_completed(
-                                future_to_symbol, timeout=15
-                            ):
-                                res = future.result()
-                                symbol = future_to_symbol[future]
-                                completed += 1
-                                if res:
-                                    summary_cache[symbol] = res
-                                    ticker_to_currency[symbol] = res["source_currency"]
+                    def on_progress(completed, total, partial):
+                        merged = dict(summary_cache)
+                        merged.update(partial)
+                        live.update(
+                            build_display_group(
+                                list(merged.values()),
+                                list(dividend_cache.values()),
+                                target_currency,
+                                f"Updating ({completed}/{total})...",
+                                history_points,
+                                monthly_changes,
+                                news_cache,
+                                error_symbols=failed_symbols,
+                                holdings=holdings,
+                            )
+                        )
 
-                                live.update(
-                                    build_display_group(
-                                        list(summary_cache.values()),
-                                        list(dividend_cache.values()),
-                                        target_currency,
-                                        f"Updating ({completed}/{num_holdings})...",
-                                        history_points,
-                                        monthly_changes,
-                                        news_cache,
-                                    )
-                                )
-                        except concurrent.futures.TimeoutError:
-                            # Continue with what we have if some requests timed out
-                            pass
+                    summaries, ttc, failed_symbols = fetch_summaries(
+                        holdings,
+                        target_currency,
+                        rate_cache,
+                        prev_close_cache,
+                        on_progress=on_progress,
+                    )
+                    # Merge fresh data over the cache so a ticker that failed
+                    # this cycle keeps its last-good values (flagged stale)
+                    # rather than vanishing from the table.
+                    summary_cache.update(summaries)
+                    ticker_to_currency.update(ttc)
 
                     # Re-apply the last known holiday state so zeroed tickers
-                    # don't flicker back to their stale delta after the summary
-                    # refresh overwrote them.
+                    # don't flicker back to their stale delta after the refresh.
                     apply_holiday_zeroing(summary_cache, traded_symbols)
 
                     # History (30D, every 120s), dividends and news (every 600s)
                     # only read the summary/holdings, so refresh whichever are
-                    # due concurrently rather than serially — news in particular
-                    # dominated cold-start time when run last in a chain.
+                    # due concurrently rather than serially.
                     now = time.time()
-                    history_due = ticker_to_currency and (
-                        now - last_history_update > 120 or not history_points
+                    aux = fetch_auxiliary(
+                        holdings,
+                        target_currency,
+                        summary_cache,
+                        ticker_to_currency,
+                        want_history=bool(
+                            ticker_to_currency
+                            and (now - last_history_update > 120 or not history_points)
+                        ),
+                        want_dividends=bool(
+                            summary_cache
+                            and (now - last_dividend_update > 600 or not dividend_cache)
+                        ),
+                        want_news=bool(
+                            summary_cache
+                            and (now - last_news_update > 600 or not news_cache)
+                        ),
                     )
-                    dividends_due = summary_cache and (
-                        now - last_dividend_update > 600 or not dividend_cache
-                    )
-                    news_due = summary_cache and (
-                        now - last_news_update > 600 or not news_cache
-                    )
-
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-                        hist_future = (
-                            pool.submit(
-                                fetch_history,
-                                holdings,
-                                target_currency,
-                                ticker_to_currency,
-                            )
-                            if history_due
-                            else None
-                        )
-                        div_future = (
-                            pool.submit(
-                                fetch_all_dividends, list(summary_cache.values())
-                            )
-                            if dividends_due
-                            else None
-                        )
-                        news_future = (
-                            pool.submit(get_news_data, list(summary_cache.keys()))
-                            if news_due
-                            else None
-                        )
-
-                        if hist_future is not None:
-                            new_history, new_monthly, traded = hist_future.result()
-                            if new_history:
-                                history_points = new_history
-                            if new_monthly:
-                                monthly_changes.update(new_monthly)
-                            traded_symbols = traded
-                            last_history_update = now
-                            apply_holiday_zeroing(summary_cache, traded_symbols)
-
-                        if div_future is not None:
-                            dividend_cache = div_future.result()
-                            last_dividend_update = now
-
-                        if news_future is not None:
-                            news_cache = news_future.result()
-                            last_news_update = now
+                    if "history" in aux:
+                        if aux["history"]:
+                            history_points = aux["history"]
+                        if aux["monthly"]:
+                            monthly_changes.update(aux["monthly"])
+                        traded_symbols = aux["traded"]
+                        last_history_update = now
+                        apply_holiday_zeroing(summary_cache, traded_symbols)
+                    if "dividends" in aux:
+                        dividend_cache = aux["dividends"]
+                        last_dividend_update = now
+                    if "news" in aux:
+                        news_cache = aux["news"]
+                        last_news_update = now
 
                     last_update = datetime.now().strftime("%H:%M:%S")
+
+                    if summary_cache:
+                        save_cached_portfolio(
+                            holdings,
+                            target_currency,
+                            list(summary_cache.values()),
+                            list(dividend_cache.values()),
+                            news_cache,
+                            history_points,
+                            monthly_changes,
+                        )
 
                     if not args.watch:
                         break
 
-                    market_open = is_any_market_open(holdings) and _has_market_activity(
-                        list(summary_cache.values())
+                    # A trading day means at least one held exchange printed a
+                    # bar today (real data), or — failing that — some price
+                    # actually moved. Far more reliable than movement alone for
+                    # picking the off-hours refresh cadence.
+                    trading_day = (
+                        traded_symbols is None
+                        or len(traded_symbols) > 0
+                        or _has_market_activity(list(summary_cache.values()))
                     )
+                    market_open = is_any_market_open(holdings) and trading_day
                     effective_interval = interval if market_open else max(interval, 300)
                     market_tag = "" if market_open else " | [Market Closed]"
-                    msg = f"Last update: {last_update} | Next in {effective_interval}s{market_tag} | Ctrl+C to exit"
+                    fail_tag = (
+                        f" | ⚠ {len(failed_symbols)} failed" if failed_symbols else ""
+                    )
+                    msg = (
+                        f"Last update: {last_update} | Next in {effective_interval}s"
+                        f"{market_tag}{fail_tag} | Ctrl+C to exit"
+                    )
                     live.update(
                         build_display_group(
                             list(summary_cache.values()),
@@ -897,6 +1168,8 @@ def fetch_portfolio():
                             history_points,
                             monthly_changes,
                             news_cache,
+                            error_symbols=failed_symbols,
+                            holdings=holdings,
                         )
                     )
 
@@ -917,6 +1190,7 @@ def fetch_portfolio():
 
                     if triggered:
                         rate_cache.clear()
+                        prev_close_cache.clear()
                         continue
             finally:
                 if args.watch and sys.stdin.isatty() and termios:
@@ -935,6 +1209,8 @@ def fetch_portfolio():
                     history_points,
                     monthly_changes,
                     news_cache,
+                    error_symbols=failed_symbols,
+                    holdings=holdings,
                 )
             )
 
