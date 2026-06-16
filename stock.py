@@ -202,12 +202,39 @@ def get_rate(source, target, cache):
             return None
 
 
+def _previous_close_from_history(ticker):
+    """Fall back to daily history when fast_info lacks a previous close.
+
+    yfinance's fast_info intermittently returns NaN for
+    regularMarketPreviousClose (and previousClose) on some exchanges. Left
+    unhandled that forces the daily change to 0, hiding real up/down moves.
+    The prior session's close is the most recent daily bar before today, or
+    the last bar if today's hasn't appeared yet.
+    """
+    try:
+        closes = ticker.history(period="5d")["Close"].dropna()
+        if len(closes) < 1:
+            return None
+        last_bar = closes.index[-1]
+        tz = getattr(last_bar, "tzinfo", None)
+        today = (pd.Timestamp.now(tz=tz) if tz else pd.Timestamp.now()).date()
+        if last_bar.date() == today:
+            return float(closes.iloc[-2]) if len(closes) >= 2 else None
+        return float(closes.iloc[-1])
+    except Exception:
+        return None
+
+
 def get_ticker_summary(symbol, qty, target_currency, rate_cache):
     try:
         t = yf.Ticker(symbol)
         fi = t.fast_info
         price = fi.get("lastPrice")
-        prev_close = fi.get("regularMarketPreviousClose") or fi.get("previousClose")
+        prev_close = fi.get("regularMarketPreviousClose")
+        if prev_close is None or pd.isna(prev_close):
+            prev_close = fi.get("previousClose")
+        if prev_close is None or pd.isna(prev_close):
+            prev_close = _previous_close_from_history(t)
         source_currency = fi.get("currency", "USD")
         conv = get_rate(source_currency, target_currency, rate_cache)
 
@@ -265,14 +292,66 @@ def get_dividend_data(summary_data):
     return None
 
 
+def fetch_all_dividends(summary_values):
+    summary_values = list(summary_values)
+    results = {}
+    if not summary_values:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(summary_values)
+    ) as executor:
+        future_to_symbol = {
+            executor.submit(get_dividend_data, s): s["symbol"] for s in summary_values
+        }
+        for future in concurrent.futures.as_completed(future_to_symbol):
+            res = future.result()
+            if res:
+                results[future_to_symbol[future]] = res
+    return results
+
+
+def apply_holiday_zeroing(summary_cache, traded_symbols):
+    """Zero the daily change for tickers whose exchange didn't trade today.
+
+    yfinance keeps reporting the previous session's delta on a closed
+    exchange, which is misleading. ``traded_symbols`` of None means "no
+    holiday information yet" — leave the live values untouched. Applied after
+    every summary refresh (not just when history is refetched) so the zeroing
+    survives the next ``get_ticker_summary`` overwrite instead of flickering.
+    """
+    if traded_symbols is None:
+        return
+    for sym, data in summary_cache.items():
+        if sym not in traded_symbols:
+            data["chg_pct"] = 0
+            data["daily_chg_val"] = 0
+            data["val_prev"] = data["val_now"]
+
+
+def _fetch_raw_news(symbol):
+    try:
+        return yf.Ticker(symbol).news or []
+    except Exception:
+        return []
+
+
 def get_news_data(symbols, max_age_days=14):
     news_items = []
     seen_titles = set()
     cutoff = datetime.now(ZoneInfo("UTC")) - pd.Timedelta(days=max_age_days)
-    for symbol in symbols:
+    symbols = list(symbols)
+    if not symbols:
+        return []
+
+    # Fetch each ticker's news concurrently — these are independent network
+    # round-trips and dominated cold-start time when done serially. Process
+    # results in the original symbol order so title de-duplication stays
+    # deterministic (the first symbol to carry a title wins).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(symbols)) as executor:
+        raw_news = list(executor.map(_fetch_raw_news, symbols))
+
+    for symbol, articles in zip(symbols, raw_news):
         try:
-            t = yf.Ticker(symbol)
-            articles = t.news or []
             for article in articles[:3]:
                 content = article.get("content", {})
                 title = content.get("title", "")
@@ -422,15 +501,27 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
             if has_data:
                 history_totals.append(daily_total)
 
-        # Determine which tickers actually traded today (per-exchange
-        # holidays mean some may be open while others are closed).
+        # Determine which exchanges actually traded today. Per-exchange
+        # holidays mean some may be open while others are closed, but all
+        # tickers on one exchange share a calendar — so we decide per
+        # exchange, not per ticker. yfinance's daily bar for the in-progress
+        # session lags for some tickers, so requiring every ticker to have a
+        # today bar would wrongly flag live tickers as untraded (and the
+        # watch loop would zero out their real fast_info day change).
         today = pd.Timestamp.now().normalize()
-        traded_today = set()
-        if today in close_data.index:
-            original_today = df["Close"].loc[today] if today in df["Close"].index else pd.Series(dtype=float)
-            for sym in symbols:
-                if sym in original_today.index and pd.notna(original_today[sym]):
-                    traded_today.add(sym)
+        original_today = (
+            df["Close"].loc[today]
+            if today in df["Close"].index
+            else pd.Series(dtype=float)
+        )
+        traded_suffixes = {
+            _get_exchange_suffix(sym)
+            for sym in symbols
+            if sym in original_today.index and pd.notna(original_today[sym])
+        }
+        traded_today = {
+            sym for sym in symbols if _get_exchange_suffix(sym) in traded_suffixes
+        }
 
         return history_totals, monthly_changes, traded_today
     except Exception:
@@ -654,6 +745,7 @@ def fetch_portfolio():
         last_history_update = 0
         last_dividend_update = 0
         last_news_update = 0
+        traded_symbols = None
         ticker_to_currency = {}
         rate_cache = {}
         last_update = "Initializing..."
@@ -685,7 +777,7 @@ def fetch_portfolio():
                     num_holdings = len(holdings)
                     completed = 0
                     with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=num_holdings
+                        max_workers=max(1, num_holdings)
                     ) as executor:
                         future_to_symbol = {
                             executor.submit(
@@ -719,49 +811,67 @@ def fetch_portfolio():
                             # Continue with what we have if some requests timed out
                             pass
 
-                    # Fetch 30D history if needed (every 120s)
+                    # Re-apply the last known holiday state so zeroed tickers
+                    # don't flicker back to their stale delta after the summary
+                    # refresh overwrote them.
+                    apply_holiday_zeroing(summary_cache, traded_symbols)
+
+                    # History (30D, every 120s), dividends and news (every 600s)
+                    # only read the summary/holdings, so refresh whichever are
+                    # due concurrently rather than serially — news in particular
+                    # dominated cold-start time when run last in a chain.
                     now = time.time()
-                    if ticker_to_currency and (
+                    history_due = ticker_to_currency and (
                         now - last_history_update > 120 or not history_points
-                    ):
-                        new_history, new_monthly, traded = fetch_history(
-                            holdings, target_currency, ticker_to_currency
+                    )
+                    dividends_due = summary_cache and (
+                        now - last_dividend_update > 600 or not dividend_cache
+                    )
+                    news_due = summary_cache and (
+                        now - last_news_update > 600 or not news_cache
+                    )
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                        hist_future = (
+                            pool.submit(
+                                fetch_history,
+                                holdings,
+                                target_currency,
+                                ticker_to_currency,
+                            )
+                            if history_due
+                            else None
                         )
-                        if new_history:
-                            history_points = new_history
-                        if new_monthly:
-                            monthly_changes.update(new_monthly)
-                        last_history_update = now
+                        div_future = (
+                            pool.submit(
+                                fetch_all_dividends, list(summary_cache.values())
+                            )
+                            if dividends_due
+                            else None
+                        )
+                        news_future = (
+                            pool.submit(get_news_data, list(summary_cache.keys()))
+                            if news_due
+                            else None
+                        )
 
-                        # Zero out daily changes for tickers whose exchange
-                        # didn't trade today — yfinance still reports the last
-                        # session's delta which is misleading on holidays.
-                        for sym, data in summary_cache.items():
-                            if sym not in traded:
-                                data["chg_pct"] = 0
-                                data["daily_chg_val"] = 0
-                                data["val_prev"] = data["val_now"]
+                        if hist_future is not None:
+                            new_history, new_monthly, traded = hist_future.result()
+                            if new_history:
+                                history_points = new_history
+                            if new_monthly:
+                                monthly_changes.update(new_monthly)
+                            traded_symbols = traded
+                            last_history_update = now
+                            apply_holiday_zeroing(summary_cache, traded_symbols)
 
-                    if summary_cache and (now - last_dividend_update > 600 or not dividend_cache):
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=len(summary_cache)
-                        ) as executor:
-                            div_future_to_symbol = {
-                                executor.submit(get_dividend_data, s): s["symbol"]
-                                for s in summary_cache.values()
-                            }
-                            for future in concurrent.futures.as_completed(
-                                div_future_to_symbol
-                            ):
-                                res = future.result()
-                                symbol = div_future_to_symbol[future]
-                                if res:
-                                    dividend_cache[symbol] = res
-                        last_dividend_update = now
+                        if div_future is not None:
+                            dividend_cache = div_future.result()
+                            last_dividend_update = now
 
-                    if summary_cache and (now - last_news_update > 600 or not news_cache):
-                        news_cache = get_news_data(list(summary_cache.keys()))
-                        last_news_update = now
+                        if news_future is not None:
+                            news_cache = news_future.result()
+                            last_news_update = now
 
                     last_update = datetime.now().strftime("%H:%M:%S")
 
@@ -797,7 +907,7 @@ def fetch_portfolio():
                                     sys.stdin.read(1)
                                 triggered = True
                                 break
-                        if time.time() - start_wait > interval + 5:
+                        if time.time() - start_wait > effective_interval + 5:
                             triggered = True
                             break
 

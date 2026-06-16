@@ -14,7 +14,9 @@ from stock import (
     KNOWN_CURRENCIES,
     _get_exchange_suffix,
     _has_market_activity,
+    apply_holiday_zeroing,
     build_display_group,
+    fetch_all_dividends,
     fetch_history,
     get_dividend_data,
     get_news_data,
@@ -226,6 +228,26 @@ class TestGetTickerSummary:
         result = get_ticker_summary("AAPL", 10, "USD", {})
         assert result is not None
         assert result["chg_pct"] == 0
+
+    def test_nan_prev_close_falls_back_to_history(self, mocker):
+        """fast_info often returns NaN for regularMarketPreviousClose; the
+        day change must come from daily history instead of collapsing to 0."""
+        dates = pd.DatetimeIndex(
+            [pd.Timestamp.now().normalize() - pd.Timedelta(days=1)]
+        )
+        hist = pd.DataFrame({"Close": [54.3]}, index=dates)
+        mock = MagicMock()
+        mock.fast_info = {
+            "lastPrice": 55.5,
+            "regularMarketPreviousClose": float("nan"),
+            "previousClose": float("nan"),
+            "currency": "SEK",
+        }
+        mock.history.return_value = hist
+        mocker.patch("yfinance.Ticker", return_value=mock)
+        result = get_ticker_summary("SVOL-B.ST", 100, "SEK", {})
+        assert result is not None
+        assert result["chg_pct"] == pytest.approx((55.5 - 54.3) / 54.3 * 100)
 
     def test_nan_price_returns_none(self, mocker):
         fi = {
@@ -553,6 +575,27 @@ class TestFetchHistory:
         totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
         assert "7203.T" in traded
         assert "SVOL-B.ST" not in traded
+
+    def test_traded_today_per_exchange_not_per_ticker(self, mocker):
+        """A ticker whose today bar lags in yfinance's daily download should
+        still count as traded if a sibling on the same exchange has data.
+        Otherwise its live fast_info day change gets wrongly zeroed."""
+        today = pd.Timestamp.now().normalize()
+        yesterday = today - pd.Timedelta(days=1)
+        dates = pd.DatetimeIndex([yesterday, today])
+        data = {
+            # Same exchange (.ST): one has today's bar, one lags (NaN today)
+            ("Close", "LIFCO-B.ST"): [100.0, 102.0],
+            ("Close", "INVE-B.ST"): [200.0, float("nan")],
+        }
+        mi_df = pd.DataFrame(data, index=dates)
+        mi_df.columns = pd.MultiIndex.from_tuples(mi_df.columns)
+        mocker.patch("yfinance.download", return_value=mi_df)
+
+        holdings = {"LIFCO-B.ST": 5, "INVE-B.ST": 10}
+        ticker_to_currency = {"LIFCO-B.ST": "SEK", "INVE-B.ST": "SEK"}
+        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        assert traded == {"LIFCO-B.ST", "INVE-B.ST"}
 
     def test_bfill_fixes_missing_rate_on_first_day(self, mocker):
         """Exchange rate NaN on the first row should be backfilled, not
@@ -938,3 +981,59 @@ class TestConstants:
 
     def test_default_holdings_not_empty(self):
         assert len(DEFAULT_HOLDINGS) > 0
+
+
+# ---------------------------------------------------------------------------
+# apply_holiday_zeroing
+# ---------------------------------------------------------------------------
+
+
+class TestApplyHolidayZeroing:
+    def _entry(self):
+        return {"val_now": 100.0, "val_prev": 90.0, "chg_pct": 11.1, "daily_chg_val": 10.0}
+
+    def test_none_traded_leaves_values_untouched(self):
+        cache = {"AAPL": self._entry()}
+        apply_holiday_zeroing(cache, None)
+        assert cache["AAPL"]["chg_pct"] == 11.1
+        assert cache["AAPL"]["daily_chg_val"] == 10.0
+
+    def test_untraded_ticker_is_zeroed(self):
+        cache = {"AAPL": self._entry(), "SVOL-B.ST": self._entry()}
+        apply_holiday_zeroing(cache, {"AAPL"})
+        assert cache["AAPL"]["chg_pct"] == 11.1
+        assert cache["SVOL-B.ST"]["chg_pct"] == 0
+        assert cache["SVOL-B.ST"]["daily_chg_val"] == 0
+        assert cache["SVOL-B.ST"]["val_prev"] == cache["SVOL-B.ST"]["val_now"]
+
+    def test_idempotent(self):
+        cache = {"SVOL-B.ST": self._entry()}
+        apply_holiday_zeroing(cache, set())
+        apply_holiday_zeroing(cache, set())
+        assert cache["SVOL-B.ST"]["chg_pct"] == 0
+        assert cache["SVOL-B.ST"]["val_prev"] == cache["SVOL-B.ST"]["val_now"]
+
+
+# ---------------------------------------------------------------------------
+# fetch_all_dividends
+# ---------------------------------------------------------------------------
+
+
+class TestFetchAllDividends:
+    def test_empty_returns_empty(self):
+        assert fetch_all_dividends([]) == {}
+
+    def test_collects_only_tickers_with_dividends(self, mocker):
+        def fake(summary):
+            if summary["symbol"] == "INVE-B.ST":
+                return {"symbol": "INVE-B.ST", "amt": 1.6}
+            return None
+
+        mocker.patch("stock.get_dividend_data", side_effect=fake)
+        summary_values = [
+            {"symbol": "INVE-B.ST"},
+            {"symbol": "MC.PA"},
+        ]
+        result = fetch_all_dividends(summary_values)
+        assert set(result) == {"INVE-B.ST"}
+        assert result["INVE-B.ST"]["amt"] == 1.6
