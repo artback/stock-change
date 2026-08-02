@@ -6,6 +6,8 @@ import time
 import json
 import argparse
 import concurrent.futures
+import io
+import shutil
 import sys
 from pathlib import Path
 from rich.console import Console
@@ -38,6 +40,8 @@ except Exception:
 # Suppress yfinance logging
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 console = Console()
+# Diagnostics go to stderr so --json keeps stdout to itself.
+err_console = Console(stderr=True)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".stock_price.yaml"
 
@@ -140,14 +144,18 @@ def _has_market_activity(summary_results):
     return any(r.get("chg_pct", 0) != 0 for r in summary_results if r)
 
 
+def resolve_config_path(config_path=None):
+    """Pick the config file to use: CLI arg, then env var, then default path."""
+    if config_path:
+        return Path(config_path)
+    env_path = os.environ.get("STOCK_PRICE_CONFIG")
+    return Path(env_path) if env_path else DEFAULT_CONFIG_PATH
+
+
 def load_config(config_path=None):
     config_data = {"holdings": DEFAULT_HOLDINGS, "currency": "EUR"}
 
-    # Priority: 1. CLI Arg, 2. Env Var, 3. Default Path
-    resolved_path = Path(config_path) if config_path else None
-    if not resolved_path:
-        env_path = os.environ.get("STOCK_PRICE_CONFIG")
-        resolved_path = Path(env_path) if env_path else DEFAULT_CONFIG_PATH
+    resolved_path = resolve_config_path(config_path)
 
     if resolved_path.exists():
         try:
@@ -166,6 +174,233 @@ def load_config(config_path=None):
         )
 
     return config_data
+
+
+# ---------------------------------------------------------------------------
+# Editing the config file
+#
+# Writing YAML back out is lossy with PyYAML — comments and key order are
+# dropped — and these files are hand-maintained, so round-trip through ruamel
+# when it is installed (it ships with the ``mcp`` extra) and degrade loudly
+# rather than silently mangling someone's file.
+# ---------------------------------------------------------------------------
+
+try:
+    from ruamel.yaml import YAML as _RoundTripYAML
+except ImportError:
+    _RoundTripYAML = None
+
+PRESERVES_COMMENTS = _RoundTripYAML is not None
+
+
+def _round_trip_yaml():
+    handler = _RoundTripYAML()
+    handler.preserve_quotes = True
+    return handler
+
+
+def read_config_document(config_path=None):
+    """Read the config file as an editable document.
+
+    Unlike :func:`load_config` this reflects *only* what is on disk: falling
+    back to the built-in demo holdings and then writing them out would silently
+    add six positions the user never owned.
+    """
+    path = resolve_config_path(config_path)
+    text = path.read_text() if path.exists() else ""
+
+    if not text.strip():
+        document = {"holdings": {}, "currency": "EUR"}
+    elif _RoundTripYAML is not None:
+        document = _round_trip_yaml().load(text)
+    else:
+        document = yaml.safe_load(text)
+
+    if not isinstance(document, dict):
+        raise ValueError(f"{path} does not contain a YAML mapping")
+    if not document.get("holdings"):
+        document["holdings"] = {}
+    return document, path
+
+
+def write_config_document(document, path):
+    """Write the config back atomically, keeping a ``.bak`` of the old file."""
+    path = Path(path)
+    buffer = io.StringIO()
+    if _RoundTripYAML is not None:
+        _round_trip_yaml().dump(document, buffer)
+    else:
+        yaml.safe_dump(dict(document), buffer, default_flow_style=False, sort_keys=False)
+    rendered = buffer.getvalue()
+
+    # Re-read what we are about to write before touching the real file, so a
+    # bug here can never leave the user with a config they can no longer load.
+    reparsed = yaml.safe_load(rendered)
+    if not isinstance(reparsed, dict) or "holdings" not in reparsed:
+        raise ValueError("refusing to write a config that would not load back")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(rendered)
+    os.replace(tmp, path)
+    return path
+
+
+def _normalise_quantity(quantity):
+    """Store whole share counts as ints so the YAML stays tidy."""
+    value = float(quantity)
+    if pd.isna(value):
+        raise ValueError("quantity must be a number")
+    return int(value) if value.is_integer() else value
+
+
+def _normalise_symbol(symbol):
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        raise ValueError("symbol must not be empty")
+    return symbol
+
+
+def _match_existing_symbol(holdings, symbol):
+    """Find the key already used for this ticker, whatever its casing."""
+    if symbol in holdings:
+        return symbol
+    lowered = symbol.lower()
+    for key in holdings:
+        if str(key).lower() == lowered:
+            return key
+    return None
+
+
+# A symbol known to be quoted, used to tell "your ticker is wrong" apart from
+# "the price service is unreachable" — the two look identical from one lookup.
+_SENTINEL_SYMBOL = "AAPL"
+
+
+def _fast_quote(symbol, attempts=2):
+    """Fetch (ticker, fast_info, price) for a symbol, or raise."""
+
+    def _fetch():
+        t = yf.Ticker(symbol)
+        fi = t.fast_info
+        return t, fi, fi.get("lastPrice")
+
+    return _retry(_fetch, attempts=attempts)
+
+
+def _price_service_reachable():
+    try:
+        _, _, price = _fast_quote(_SENTINEL_SYMBOL)
+        return price is not None and not pd.isna(price)
+    except Exception:
+        return False
+
+
+def resolve_symbol(symbol):
+    """Check that a ticker exists and is priced.
+
+    ``status`` is ``"ok"`` when the symbol resolved, ``"unknown"`` when it
+    doesn't exist (a typo, usually), and ``"unverified"`` when we couldn't
+    reach the price service to find out. That last case matters: a rate limit
+    or a dropped connection must not be mistaken for a bad ticker and block a
+    legitimate edit.
+    """
+    symbol = _normalise_symbol(symbol)
+    info = {"symbol": symbol, "status": "unknown", "name": None, "price": None,
+            "currency": None}
+    try:
+        ticker, fast_info, price = _fast_quote(symbol)
+    except Exception:
+        # An unknown ticker raises out of fast_info exactly like an outage
+        # does, so ask a symbol we know is quoted: if that one answers, the
+        # service is fine and the problem is this symbol.
+        info["status"] = "unknown" if _price_service_reachable() else "unverified"
+        return info
+
+    if price is None or pd.isna(price):
+        return info
+
+    info["status"] = "ok"
+    info["price"] = float(price)
+    info["currency"] = fast_info.get("currency")
+    try:
+        details = ticker.info
+        info["name"] = details.get("shortName") or details.get("longName")
+    except Exception:
+        pass
+    return info
+
+
+def _apply_holding_change(symbol, config_path, change):
+    """Load the config, apply ``change`` to the holdings, and write it back."""
+    symbol = _normalise_symbol(symbol)
+    document, path = read_config_document(config_path)
+    holdings = document["holdings"]
+    key = _match_existing_symbol(holdings, symbol) or symbol
+    previous = holdings.get(key)
+
+    result = change(holdings, key, previous)
+
+    write_config_document(document, path)
+    return {
+        "symbol": key,
+        "previous_quantity": previous,
+        "config_path": str(path),
+        "comments_preserved": PRESERVES_COMMENTS,
+        **result,
+    }
+
+
+def set_holding(symbol, quantity, config_path=None):
+    """Set a holding to an exact quantity, adding the ticker if it is new."""
+    quantity = _normalise_quantity(quantity)
+    if quantity <= 0:
+        raise ValueError("quantity must be positive — use remove_holding to delete")
+
+    def change(holdings, key, previous):
+        holdings[key] = quantity
+        return {"quantity": quantity, "action": "updated" if previous is not None else "added"}
+
+    return _apply_holding_change(symbol, config_path, change)
+
+
+def add_shares(symbol, quantity, config_path=None):
+    """Add to (or, with a negative quantity, subtract from) a holding."""
+    delta = _normalise_quantity(quantity)
+    if delta == 0:
+        raise ValueError("quantity must not be zero")
+
+    def change(holdings, key, previous):
+        total = _normalise_quantity((previous or 0) + delta)
+        if total < 0:
+            raise ValueError(
+                f"cannot subtract {abs(delta)} from {previous or 0} {key} shares"
+            )
+        if total == 0:
+            holdings.pop(key, None)
+            return {"quantity": 0, "delta": delta, "action": "removed"}
+        holdings[key] = total
+        return {
+            "quantity": total,
+            "delta": delta,
+            "action": "updated" if previous is not None else "added",
+        }
+
+    return _apply_holding_change(symbol, config_path, change)
+
+
+def remove_holding(symbol, config_path=None):
+    """Drop a ticker from the portfolio entirely."""
+
+    def change(holdings, key, previous):
+        if previous is None:
+            raise KeyError(f"{key} is not in the portfolio")
+        holdings.pop(key, None)
+        return {"quantity": 0, "action": "removed"}
+
+    return _apply_holding_change(symbol, config_path, change)
 
 
 KNOWN_CURRENCIES = {"EUR", "USD", "GBP", "SEK", "JPY", "CHF", "CAD", "AUD", "NOK", "DKK", "CNY", "HKD", "SGD", "NZD", "KRW", "INR", "BRL", "MXN", "ZAR", "TRY", "PLN", "CZK", "HUF", "ILS", "TWD", "THB"}
@@ -356,6 +591,180 @@ def fetch_all_dividends(summary_values):
             if res:
                 results[future_to_symbol[future]] = res
     return results
+
+
+# Analyst consensus is scored on the 1 (Strong Buy) .. 5 (Strong Sell) scale
+# the rating aggregators use, so a *lower* score is the more bullish one.
+_RATING_WEIGHTS = (
+    ("strongBuy", "strong_buy", 1),
+    ("buy", "buy", 2),
+    ("hold", "hold", 3),
+    ("sell", "sell", 4),
+    ("strongSell", "strong_sell", 5),
+)
+
+_CONSENSUS_THRESHOLDS = (
+    (1.5, "Strong Buy"),
+    (2.5, "Buy"),
+    (3.5, "Hold"),
+    (4.5, "Sell"),
+)
+
+CONSENSUS_STYLES = {
+    "Strong Buy": "bold green",
+    "Buy": "green",
+    "Hold": "yellow",
+    "Sell": "red",
+    "Strong Sell": "bold red",
+}
+
+# Ignore consensus drift smaller than this — the score moves whenever a single
+# analyst joins or drops coverage, which isn't a change of opinion.
+_TREND_EPSILON = 0.05
+
+
+def consensus_label(score):
+    """Map a 1..5 analyst score onto its human label."""
+    if score is None or pd.isna(score):
+        return None
+    for threshold, label in _CONSENSUS_THRESHOLDS:
+        if score < threshold:
+            return label
+    return "Strong Sell"
+
+
+def _score_ratings(row):
+    """Return ``(score, counts, total)`` for one recommendations row."""
+    counts = {}
+    total = 0
+    weighted = 0
+    for source_key, out_key, weight in _RATING_WEIGHTS:
+        n = row.get(source_key)
+        n = 0 if n is None or pd.isna(n) else int(n)
+        counts[out_key] = n
+        total += n
+        weighted += n * weight
+    if total == 0:
+        return None, counts, 0
+    return weighted / total, counts, total
+
+
+def _consensus_trend(score, previous):
+    """Direction the consensus moved over the last month.
+
+    Reported in plain-English terms rather than the raw score: because the
+    scale is inverted, a *falling* score is an upgrade.
+    """
+    if score is None or previous is None or pd.isna(score) or pd.isna(previous):
+        return None
+    if previous - score > _TREND_EPSILON:
+        return "up"
+    if score - previous > _TREND_EPSILON:
+        return "down"
+    return "steady"
+
+
+def get_analyst_data(summary_data):
+    """Collect analyst ratings and price targets for one holding.
+
+    Returns ``None`` when the ticker has no coverage to report — index funds
+    and most small caps come back with an empty recommendations table and a
+    price-target dict holding nothing but the current price.
+    """
+    try:
+        t = summary_data["ticker_obj"]
+
+        score = previous_score = None
+        counts = {}
+        total = 0
+        recs = t.recommendations
+        if recs is not None and not recs.empty:
+            by_period = {
+                str(row.get("period", "")): row for row in recs.to_dict("records")
+            }
+            score, counts, total = _score_ratings(by_period.get("0m", {}))
+            previous_score, _, _ = _score_ratings(by_period.get("-1m", {}))
+
+        targets = t.analyst_price_targets or {}
+        current = targets.get("current")
+        mean = targets.get("mean")
+        upside = None
+        if (
+            current
+            and mean
+            and not pd.isna(current)
+            and not pd.isna(mean)
+        ):
+            upside = ((mean - current) / current) * 100
+
+        # Nothing worth showing: no ratings and no target to compare against.
+        if score is None and upside is None:
+            return None
+
+        price_target = None
+        if mean is not None and not pd.isna(mean):
+            price_target = {
+                "current": current,
+                "low": targets.get("low"),
+                "mean": mean,
+                "median": targets.get("median"),
+                "high": targets.get("high"),
+                "currency": summary_data.get("source_currency"),
+                "upside_pct": upside,
+            }
+
+        return {
+            "symbol": summary_data["symbol"],
+            "score": score,
+            "consensus": consensus_label(score),
+            "previous_score": previous_score,
+            "trend": _consensus_trend(score, previous_score),
+            "analyst_count": total,
+            "counts": counts,
+            "price_target": price_target,
+        }
+    except Exception:
+        pass
+    return None
+
+
+def fetch_all_analysts(summary_values):
+    summary_values = list(summary_values)
+    results = {}
+    if not summary_values:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(summary_values)
+    ) as executor:
+        future_to_symbol = {
+            executor.submit(get_analyst_data, s): s["symbol"] for s in summary_values
+        }
+        for future in concurrent.futures.as_completed(future_to_symbol):
+            res = future.result()
+            if res:
+                results[future_to_symbol[future]] = res
+    return results
+
+
+def analyst_view(symbol):
+    """Analyst ratings and price targets for any ticker, held or not.
+
+    Returns ``None`` if the symbol doesn't resolve; ``analysts`` is ``None``
+    when it resolves but has no coverage.
+    """
+    instrument = resolve_symbol(symbol)
+    if instrument["status"] == "unknown":
+        return None
+    return {
+        "instrument": instrument,
+        "analysts": get_analyst_data(
+            {
+                "symbol": instrument["symbol"],
+                "ticker_obj": yf.Ticker(instrument["symbol"]),
+                "source_currency": instrument["currency"],
+            }
+        ),
+    }
 
 
 def apply_holiday_zeroing(summary_cache, traded_symbols):
@@ -655,16 +1064,17 @@ def fetch_auxiliary(
     want_history=False,
     want_dividends=False,
     want_news=False,
+    want_analysts=False,
 ):
-    """Refresh whichever of history/dividends/news are requested, concurrently.
+    """Refresh whichever of the auxiliary sections are requested, concurrently.
 
     Returns a dict with keys ``history``/``monthly``/``traded`` (when history
-    was requested), ``dividends`` and ``news`` — present only for the sections
-    that were requested. They only read the summary/holdings, so running them
-    together avoids serialising independent network round-trips.
+    was requested), ``dividends``, ``news`` and ``analysts`` — present only for
+    the sections that were requested. They only read the summary/holdings, so
+    running them together avoids serialising independent network round-trips.
     """
     result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         hist_future = (
             pool.submit(fetch_history, holdings, target_currency, ticker_to_currency)
             if want_history
@@ -680,6 +1090,11 @@ def fetch_auxiliary(
             if want_news
             else None
         )
+        analyst_future = (
+            pool.submit(fetch_all_analysts, list(summaries.values()))
+            if want_analysts
+            else None
+        )
 
         if hist_future is not None:
             history, monthly, traded = hist_future.result()
@@ -690,6 +1105,8 @@ def fetch_auxiliary(
             result["dividends"] = div_future.result()
         if news_future is not None:
             result["news"] = news_future.result()
+        if analyst_future is not None:
+            result["analysts"] = analyst_future.result()
     return result
 
 
@@ -735,7 +1152,7 @@ def load_cached_portfolio(holdings, currency, ttl, path=CACHE_PATH):
 
 def save_cached_portfolio(
     holdings, currency, summaries, dividends, news, history_points, monthly_changes,
-    path=CACHE_PATH,
+    path=CACHE_PATH, analysts=None,
 ):
     """Persist a portfolio snapshot for fast repeated runs. Best-effort."""
     try:
@@ -750,10 +1167,261 @@ def save_cached_portfolio(
             "news": news,
             "history_points": history_points,
             "monthly_changes": monthly_changes,
+            "analysts": analysts or {},
         }
         Path(path).write_text(json.dumps(payload))
     except Exception:
         pass
+
+
+JSON_SCHEMA_VERSION = 1
+
+
+def _json_safe(value):
+    """Recursively coerce a value into something ``json.dumps`` accepts.
+
+    Prices arrive as numpy scalars and missing ones as ``NaN``/``NaT``; both
+    would serialise to bare ``NaN``, which is not valid JSON and breaks strict
+    parsers. Doing this once over the finished payload makes "the output always
+    parses" a structural guarantee rather than a per-field discipline.
+    """
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return None if pd.isna(value) else value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        return _json_safe(value.item())
+    return str(value)
+
+
+def portfolio_payload(
+    target_currency,
+    summaries,
+    dividends,
+    news,
+    history_points,
+    monthly_changes,
+    *,
+    analysts=None,
+    failed=None,
+    holdings=None,
+    cached=False,
+    cache_age=None,
+    generated_at=None,
+):
+    """Build the machine-readable portfolio snapshot behind ``--json``.
+
+    Deliberately separate from both the fetching and the rendering: the live
+    and cached paths emit an identical shape, and an out-of-process consumer
+    (an MCP server, a cron job) can reuse it without touching the terminal UI.
+    """
+    analysts = analysts or {}
+    monthly_changes = monthly_changes or {}
+    failed = set(failed or ())
+    history_points = list(history_points or ())
+
+    positions = []
+    total_val = 0.0
+    total_prev = 0.0
+    total_daily = 0.0
+    for s in sorted(summaries, key=lambda x: x["symbol"]):
+        symbol = s["symbol"]
+        val_now = s.get("val_now")
+        val_prev = s.get("val_prev")
+        daily = s.get("daily_chg_val")
+
+        if val_now is not None and not pd.isna(val_now):
+            total_val += val_now
+        if val_prev is not None and not pd.isna(val_prev):
+            total_prev += val_prev
+        elif val_now is not None and not pd.isna(val_now):
+            total_prev += val_now
+        if daily is not None and not pd.isna(daily):
+            total_daily += daily
+
+        positions.append(
+            {
+                "symbol": symbol,
+                # "stale" means the last refresh failed, so the figures are the
+                # last known good ones rather than current.
+                "status": "stale" if symbol in failed else "ok",
+                "quantity": s.get("qty"),
+                "value": val_now,
+                "previous_value": val_prev,
+                "daily_change": daily,
+                "daily_change_pct": s.get("chg_pct"),
+                "month_change_pct": monthly_changes.get(symbol),
+                "source_currency": s.get("source_currency"),
+                "fx_rate": s.get("conv"),
+                "analysts": analysts.get(symbol),
+            }
+        )
+
+    # Holdings that never loaded at all would otherwise be missing entirely,
+    # making a partial portfolio look complete to whatever consumes this.
+    loaded = {s["symbol"] for s in summaries}
+    for symbol in sorted(failed - loaded):
+        positions.append(
+            {
+                "symbol": symbol,
+                "status": "error",
+                "quantity": (holdings or {}).get(symbol),
+                "value": None,
+                "previous_value": None,
+                "daily_change": None,
+                "daily_change_pct": None,
+                "month_change_pct": None,
+                "source_currency": None,
+                "fx_rate": None,
+                "analysts": None,
+            }
+        )
+
+    month_change_pct = None
+    if len(history_points) > 1 and history_points[0]:
+        month_change_pct = (
+            (history_points[-1] - history_points[0]) / history_points[0]
+        ) * 100
+
+    payload = {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "generated_at": (generated_at or datetime.now().astimezone()).isoformat(
+            timespec="seconds"
+        ),
+        "currency": target_currency,
+        "cached": bool(cached),
+        "cache_age_seconds": cache_age,
+        "totals": {
+            "value": total_val,
+            "previous_value": total_prev,
+            "daily_change": total_daily,
+            "daily_change_pct": (
+                ((total_val - total_prev) / total_prev) * 100 if total_prev else 0.0
+            ),
+            "month_change_pct": month_change_pct,
+        },
+        "positions": positions,
+        "dividends": [
+            {**d, "ex_date": str(d["ex_date"])}
+            for d in sorted(dividends, key=lambda x: str(x["ex_date"]))
+        ],
+        "news": list(news or ()),
+        "history_points": history_points,
+    }
+    return _json_safe(payload)
+
+
+def collect_portfolio(
+    holdings,
+    target_currency,
+    *,
+    cache_ttl=0,
+    want_analysts=True,
+    cache_path=CACHE_PATH,
+):
+    """Fetch a full portfolio snapshot and return it as a JSON-ready payload.
+
+    The quiet counterpart to the live TUI loop — it renders nothing, so stdout
+    stays clean for ``--json`` consumers.
+    """
+    cached = load_cached_portfolio(
+        holdings, target_currency, cache_ttl, path=cache_path
+    )
+    if cached:
+        return portfolio_payload(
+            target_currency,
+            cached.get("summaries", []),
+            cached.get("dividends", []),
+            cached.get("news", []),
+            cached.get("history_points", []),
+            cached.get("monthly_changes", {}),
+            analysts=cached.get("analysts", {}),
+            holdings=holdings,
+            cached=True,
+            cache_age=int(cached.get("age", 0)),
+        )
+
+    summaries, ticker_to_currency, failed = fetch_summaries(
+        holdings, target_currency, {}, {}
+    )
+    aux = fetch_auxiliary(
+        holdings,
+        target_currency,
+        summaries,
+        ticker_to_currency,
+        want_history=bool(ticker_to_currency),
+        want_dividends=bool(summaries),
+        want_news=bool(summaries),
+        want_analysts=bool(summaries) and want_analysts,
+    )
+    apply_holiday_zeroing(summaries, aux.get("traded"))
+
+    dividends = list(aux.get("dividends", {}).values())
+    news = aux.get("news", [])
+    analysts = aux.get("analysts", {})
+    history_points = aux.get("history", [])
+    monthly_changes = aux.get("monthly", {})
+
+    if summaries:
+        save_cached_portfolio(
+            holdings,
+            target_currency,
+            list(summaries.values()),
+            dividends,
+            news,
+            history_points,
+            monthly_changes,
+            path=cache_path,
+            analysts=analysts,
+        )
+
+    return portfolio_payload(
+        target_currency,
+        list(summaries.values()),
+        dividends,
+        news,
+        history_points,
+        monthly_changes,
+        analysts=analysts,
+        failed=failed,
+        holdings=holdings,
+    )
+
+
+def _analyst_cells(info):
+    """Render the (consensus, target upside) table cells for one holding."""
+    if not info:
+        return Text("-", style="dim"), Text("-", style="dim")
+
+    consensus = info.get("consensus")
+    if consensus:
+        arrow = {"up": " ↑", "down": " ↓"}.get(info.get("trend"), "")
+        consensus_cell = Text(
+            f"{consensus}{arrow}", style=CONSENSUS_STYLES.get(consensus, "white")
+        )
+        count = info.get("analyst_count")
+        if count:
+            consensus_cell.append(f" {count}", style="dim")
+    else:
+        consensus_cell = Text("-", style="dim")
+
+    upside = (info.get("price_target") or {}).get("upside_pct")
+    if upside is None or pd.isna(upside):
+        target_cell = Text("-", style="dim")
+    else:
+        target_cell = Text(
+            f"{upside:+.1f}%", style="green" if upside >= 0 else "red"
+        )
+    return consensus_cell, target_cell
 
 
 def build_display_group(
@@ -766,10 +1434,15 @@ def build_display_group(
     news_items=None,
     error_symbols=None,
     holdings=None,
+    analyst_results=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     monthly_changes = monthly_changes or {}
     error_symbols = set(error_symbols or ())
+    # Only widen the table when there is coverage to show — a portfolio of
+    # index funds has none, and two columns of "-" is just noise.
+    analyst_results = analyst_results or {}
+    show_analysts = bool(analyst_results)
 
     # 1. Summary Table (No expand=True to keep it compact)
     table = Table(
@@ -789,6 +1462,9 @@ def build_display_group(
     )
     table.add_column("Day %", justify="right", width=10, no_wrap=True)
     table.add_column("Month %", justify="right", width=10, no_wrap=True)
+    if show_analysts:
+        table.add_column("Analysts", justify="right", width=15, no_wrap=True)
+        table.add_column("Target", justify="right", width=9, no_wrap=True)
 
     total_val = 0
     total_prev = 0
@@ -822,7 +1498,7 @@ def build_display_group(
         else:
             ticker_cell = s["symbol"]
 
-        table.add_row(
+        row = [
             ticker_cell,
             f"{s['qty']:,}",
             f"{val_now:,.2f} {target_symbol}" if not pd.isna(val_now) else "-",
@@ -836,7 +1512,10 @@ def build_display_group(
             if not pd.isna(chg_pct)
             else Text("-", style="dim"),
             m_text,
-        )
+        ]
+        if show_analysts:
+            row.extend(_analyst_cells(analyst_results.get(s["symbol"])))
+        table.add_row(*row)
 
     # Tickers that have never loaded (no cached data at all) would otherwise
     # vanish entirely — show them explicitly as errored so a partial portfolio
@@ -844,14 +1523,17 @@ def build_display_group(
     loaded = {s["symbol"] for s in summary_results}
     for sym in sorted(error_symbols - loaded):
         qty = (holdings or {}).get(sym)
-        table.add_row(
+        row = [
             Text(f"{sym} ⚠", style="red"),
             f"{qty:,}" if isinstance(qty, (int, float)) else "",
             Text("error", style="dim red"),
             Text("-", style="dim"),
             Text("-", style="dim"),
             Text("-", style="dim"),
-        )
+        ]
+        if show_analysts:
+            row.extend((Text("-", style="dim"), Text("-", style="dim")))
+        table.add_row(*row)
 
     if summary_results:
         total_chg_pct = (
@@ -860,7 +1542,7 @@ def build_display_group(
             else 0
         )
         table.add_section()
-        table.add_row(
+        total_row = [
             Text("TOTAL", style="bold"),
             "",
             Text(f"{total_val:,.2f} {target_symbol}", style="bold white"),
@@ -873,7 +1555,10 @@ def build_display_group(
                 style="bold green" if total_chg_pct >= 0 else "bold red",
             ),
             Text(""),
-        )
+        ]
+        if show_analysts:
+            total_row.extend((Text(""), Text("")))
+        table.add_row(*total_row)
 
     # 2. Dividends Table
     div_table = None
@@ -979,23 +1664,46 @@ def fetch_portfolio():
         help="Reuse cached results younger than N seconds for instant repeat "
         "runs (0 = disabled; one-shot mode only)",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the portfolio as JSON on stdout instead of rendering a table",
+    )
+    parser.add_argument(
+        "--no-analysts",
+        action="store_true",
+        help="Skip analyst ratings and price targets",
+    )
     args = parser.parse_args()
+
+    if args.json and args.watch:
+        parser.error("--json cannot be combined with --watch (it is one-shot)")
 
     config = load_config(args.config)
     target_currency = (args.currency or config["currency"]).upper()
     holdings = config["holdings"]
 
-    # Set terminal title
-    if sys.stdout.isatty():
+    # Set terminal title (never in --json mode: stdout belongs to the payload)
+    if sys.stdout.isatty() and not args.json:
         sys.stdout.write("\033]0;Stock Price\007")
         sys.stdout.flush()
 
     try:
         if not validate_currency(target_currency):
-            console.print(
+            err_console.print(
                 f"[bold red]ERROR:[/bold red] '{target_currency}' is not a valid ISO currency code."
             )
             sys.exit(1)
+
+        if args.json:
+            payload = collect_portfolio(
+                holdings,
+                target_currency,
+                cache_ttl=args.cache_ttl,
+                want_analysts=not args.no_analysts,
+            )
+            print(json.dumps(payload, indent=2, allow_nan=False))
+            return
 
         # Instant repeat runs: render a fresh-enough cached snapshot and exit.
         if not args.watch:
@@ -1011,6 +1719,7 @@ def fetch_portfolio():
                         cached.get("history_points", []),
                         cached.get("monthly_changes", {}),
                         cached.get("news", []),
+                        analyst_results=cached.get("analysts", {}),
                     )
                 )
                 return
@@ -1018,11 +1727,13 @@ def fetch_portfolio():
         summary_cache = {}
         dividend_cache = {}
         news_cache = []
+        analyst_cache = {}
         history_points = []
         monthly_changes = {}
         last_history_update = 0
         last_dividend_update = 0
         last_news_update = 0
+        last_analyst_update = 0
         traded_symbols = None
         failed_symbols = []
         ticker_to_currency = {}
@@ -1067,6 +1778,7 @@ def fetch_portfolio():
                                 news_cache,
                                 error_symbols=failed_symbols,
                                 holdings=holdings,
+                                analyst_results=analyst_cache,
                             )
                         )
 
@@ -1108,6 +1820,14 @@ def fetch_portfolio():
                             summary_cache
                             and (now - last_news_update > 600 or not news_cache)
                         ),
+                        # Analyst data moves on a scale of days and is served by
+                        # the rate-limit-prone fundamentals endpoint, so keep it
+                        # firmly off the fast refresh path.
+                        want_analysts=bool(
+                            summary_cache
+                            and not args.no_analysts
+                            and (now - last_analyst_update > 600 or not analyst_cache)
+                        ),
                     )
                     if "history" in aux:
                         if aux["history"]:
@@ -1123,6 +1843,12 @@ def fetch_portfolio():
                     if "news" in aux:
                         news_cache = aux["news"]
                         last_news_update = now
+                    if "analysts" in aux:
+                        # Keep the previous values when a refresh comes back
+                        # empty (rate limit) rather than blanking the columns.
+                        if aux["analysts"]:
+                            analyst_cache = aux["analysts"]
+                        last_analyst_update = now
 
                     last_update = datetime.now().strftime("%H:%M:%S")
 
@@ -1135,6 +1861,7 @@ def fetch_portfolio():
                             news_cache,
                             history_points,
                             monthly_changes,
+                            analysts=analyst_cache,
                         )
 
                     if not args.watch:
@@ -1170,6 +1897,7 @@ def fetch_portfolio():
                             news_cache,
                             error_symbols=failed_symbols,
                             holdings=holdings,
+                            analyst_results=analyst_cache,
                         )
                     )
 
@@ -1211,6 +1939,7 @@ def fetch_portfolio():
                     news_cache,
                     error_symbols=failed_symbols,
                     holdings=holdings,
+                    analyst_results=analyst_cache,
                 )
             )
 

@@ -1,5 +1,7 @@
+import json
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -9,19 +11,32 @@ from rich.console import Console
 
 from stock import (
     CURRENCY_SYMBOLS,
+    DEFAULT_CONFIG_PATH,
     DEFAULT_HOLDINGS,
     DEFAULT_SCHEDULE,
     EXCHANGE_SCHEDULES,
+    JSON_SCHEMA_VERSION,
     KNOWN_CURRENCIES,
+    PRESERVES_COMMENTS,
+    _consensus_trend,
+    _price_service_reachable,
     _get_exchange_suffix,
     _has_market_activity,
+    _json_safe,
     _retry,
+    _score_ratings,
+    add_shares,
+    analyst_view,
     apply_holiday_zeroing,
     build_display_group,
+    collect_portfolio,
+    consensus_label,
+    fetch_all_analysts,
     fetch_all_dividends,
     fetch_auxiliary,
     fetch_history,
     fetch_summaries,
+    get_analyst_data,
     get_dividend_data,
     get_news_data,
     get_rate,
@@ -29,9 +44,16 @@ from stock import (
     is_any_market_open,
     load_cached_portfolio,
     load_config,
+    portfolio_payload,
+    read_config_document,
+    remove_holding,
     render_sparkline,
+    resolve_config_path,
+    resolve_symbol,
     save_cached_portfolio,
+    set_holding,
     validate_currency,
+    write_config_document,
 )
 
 
@@ -1289,3 +1311,855 @@ class TestBuildDisplayErrors:
         group = build_display_group([self._summary("AAPL")], [], "USD")
         out = self._render(group)
         assert "⚠" not in out
+
+
+# ---------------------------------------------------------------------------
+# analyst consensus scoring
+# ---------------------------------------------------------------------------
+
+
+def _recs_frame(rows):
+    return pd.DataFrame(rows)
+
+
+_FULL_BUY_ROW = {
+    "period": "0m",
+    "strongBuy": 6,
+    "buy": 22,
+    "hold": 14,
+    "sell": 2,
+    "strongSell": 2,
+}
+
+
+class TestConsensusLabel:
+    @pytest.mark.parametrize(
+        "score,label",
+        [
+            (1.0, "Strong Buy"),
+            (1.49, "Strong Buy"),
+            (1.5, "Buy"),
+            (2.49, "Buy"),
+            (2.5, "Hold"),
+            (3.49, "Hold"),
+            (3.5, "Sell"),
+            (4.49, "Sell"),
+            (4.5, "Strong Sell"),
+            (5.0, "Strong Sell"),
+        ],
+    )
+    def test_thresholds(self, score, label):
+        assert consensus_label(score) == label
+
+    def test_none_and_nan(self):
+        assert consensus_label(None) is None
+        assert consensus_label(float("nan")) is None
+
+
+class TestScoreRatings:
+    def test_weighted_mean(self):
+        # 6*1 + 22*2 + 14*3 + 2*4 + 2*5 = 110 over 46 analysts.
+        score, counts, total = _score_ratings(_FULL_BUY_ROW)
+        assert total == 46
+        assert score == pytest.approx(110 / 46)
+        assert counts == {
+            "strong_buy": 6,
+            "buy": 22,
+            "hold": 14,
+            "sell": 2,
+            "strong_sell": 2,
+        }
+
+    def test_all_strong_buy_scores_one(self):
+        score, _, total = _score_ratings({"strongBuy": 3})
+        assert score == 1.0
+        assert total == 3
+
+    def test_no_coverage(self):
+        score, counts, total = _score_ratings({})
+        assert score is None
+        assert total == 0
+        assert counts == {
+            "strong_buy": 0,
+            "buy": 0,
+            "hold": 0,
+            "sell": 0,
+            "strong_sell": 0,
+        }
+
+    def test_nan_counts_treated_as_zero(self):
+        score, counts, total = _score_ratings({"buy": float("nan"), "hold": 2})
+        assert counts["buy"] == 0
+        assert total == 2
+        assert score == 3.0
+
+
+class TestConsensusTrend:
+    def test_falling_score_is_an_upgrade(self):
+        # The scale is inverted: 2.0 is more bullish than 2.5.
+        assert _consensus_trend(2.0, 2.5) == "up"
+
+    def test_rising_score_is_a_downgrade(self):
+        assert _consensus_trend(2.5, 2.0) == "down"
+
+    def test_small_drift_is_steady(self):
+        assert _consensus_trend(2.40, 2.42) == "steady"
+
+    def test_missing_history(self):
+        assert _consensus_trend(2.0, None) is None
+        assert _consensus_trend(None, 2.0) is None
+        assert _consensus_trend(2.0, float("nan")) is None
+
+
+# ---------------------------------------------------------------------------
+# get_analyst_data
+# ---------------------------------------------------------------------------
+
+
+class TestGetAnalystData:
+    def _summary(self, symbol="AAPL", currency="USD"):
+        return {"symbol": symbol, "ticker_obj": MagicMock(), "source_currency": currency}
+
+    def test_full_coverage(self):
+        summary = self._summary()
+        summary["ticker_obj"].recommendations = _recs_frame(
+            [
+                _FULL_BUY_ROW,
+                {**_FULL_BUY_ROW, "period": "-1m", "hold": 16, "sell": 1},
+            ]
+        )
+        summary["ticker_obj"].analyst_price_targets = {
+            "current": 100.0,
+            "low": 80.0,
+            "mean": 120.0,
+            "median": 118.0,
+            "high": 150.0,
+        }
+
+        result = get_analyst_data(summary)
+        assert result["symbol"] == "AAPL"
+        assert result["consensus"] == "Buy"
+        assert result["analyst_count"] == 46
+        assert result["counts"]["strong_buy"] == 6
+        assert result["price_target"]["upside_pct"] == pytest.approx(20.0)
+        assert result["price_target"]["currency"] == "USD"
+
+    def test_upgrade_trend_detected(self):
+        summary = self._summary()
+        summary["ticker_obj"].recommendations = _recs_frame(
+            [
+                {"period": "0m", "strongBuy": 10, "buy": 0, "hold": 0},
+                {"period": "-1m", "strongBuy": 0, "buy": 0, "hold": 10},
+            ]
+        )
+        summary["ticker_obj"].analyst_price_targets = {}
+        assert get_analyst_data(summary)["trend"] == "up"
+
+    def test_targets_only_without_ratings(self):
+        summary = self._summary()
+        summary["ticker_obj"].recommendations = pd.DataFrame()
+        summary["ticker_obj"].analyst_price_targets = {"current": 50.0, "mean": 55.0}
+
+        result = get_analyst_data(summary)
+        assert result["consensus"] is None
+        assert result["analyst_count"] == 0
+        assert result["price_target"]["upside_pct"] == pytest.approx(10.0)
+
+    def test_no_coverage_returns_none(self):
+        # An index fund: empty ratings, and a target dict holding only the
+        # current price.
+        summary = self._summary("IUSA.DE", "EUR")
+        summary["ticker_obj"].recommendations = pd.DataFrame()
+        summary["ticker_obj"].analyst_price_targets = {"current": 56.45}
+        assert get_analyst_data(summary) is None
+
+    def test_empty_targets_dict(self):
+        summary = self._summary()
+        summary["ticker_obj"].recommendations = pd.DataFrame()
+        summary["ticker_obj"].analyst_price_targets = {}
+        assert get_analyst_data(summary) is None
+
+    def test_ratings_without_targets(self):
+        summary = self._summary()
+        summary["ticker_obj"].recommendations = _recs_frame([_FULL_BUY_ROW])
+        summary["ticker_obj"].analyst_price_targets = {"current": 100.0}
+
+        result = get_analyst_data(summary)
+        assert result["consensus"] == "Buy"
+        assert result["price_target"] is None
+
+    def test_network_error_returns_none(self):
+        summary = self._summary()
+        type(summary["ticker_obj"]).recommendations = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("429"))
+        )
+        assert get_analyst_data(summary) is None
+
+
+class TestFetchAllAnalysts:
+    def test_keyed_by_symbol_skipping_uncovered(self, mocker):
+        mocker.patch(
+            "stock.get_analyst_data",
+            side_effect=lambda s: (
+                {"symbol": s["symbol"], "consensus": "Buy"}
+                if s["symbol"] == "AAPL"
+                else None
+            ),
+        )
+        result = fetch_all_analysts(
+            [{"symbol": "AAPL"}, {"symbol": "IUSA.DE"}]
+        )
+        assert set(result) == {"AAPL"}
+
+    def test_empty_input(self):
+        assert fetch_all_analysts([]) == {}
+
+
+class TestFetchAuxiliaryAnalysts:
+    def test_analysts_requested(self, mocker):
+        analysts = mocker.patch(
+            "stock.fetch_all_analysts", return_value={"A": {"consensus": "Buy"}}
+        )
+        result = fetch_auxiliary(
+            {"A": 1}, "USD", {"A": {"symbol": "A"}}, {"A": "USD"},
+            want_analysts=True,
+        )
+        assert result["analysts"] == {"A": {"consensus": "Buy"}}
+        analysts.assert_called_once()
+
+    def test_analysts_skipped_by_default(self, mocker):
+        analysts = mocker.patch("stock.fetch_all_analysts", return_value={})
+        result = fetch_auxiliary({"A": 1}, "USD", {"A": {"symbol": "A"}}, {"A": "USD"})
+        assert "analysts" not in result
+        analysts.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# analyst columns in the summary table
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDisplayGroupAnalysts:
+    def _summary(self, symbol="AAPL"):
+        return {
+            "symbol": symbol,
+            "qty": 10,
+            "val_now": 1500.0,
+            "val_prev": 1450.0,
+            "chg_pct": 3.4,
+            "daily_chg_val": 50.0,
+            "source_currency": "USD",
+        }
+
+    def _analysts(self, **overrides):
+        info = {
+            "symbol": "AAPL",
+            "consensus": "Buy",
+            "trend": "steady",
+            "analyst_count": 46,
+            "price_target": {"upside_pct": 4.65},
+        }
+        info.update(overrides)
+        return {"AAPL": info}
+
+    def test_columns_hidden_without_data(self):
+        out = _render(build_display_group([self._summary()], [], "USD"))
+        assert "Analysts" not in out
+        assert "Target" not in out
+
+    def test_consensus_and_target_rendered(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD", analyst_results=self._analysts()
+            )
+        )
+        assert "Analysts" in out
+        assert "Buy 46" in out
+        assert "+4.7%" in out
+
+    def test_upgrade_arrow(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD",
+                analyst_results=self._analysts(trend="up"),
+            )
+        )
+        assert "↑" in out
+
+    def test_downgrade_arrow(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD",
+                analyst_results=self._analysts(trend="down"),
+            )
+        )
+        assert "↓" in out
+
+    def test_uncovered_holding_shows_dash(self):
+        # MSFT has no entry, so its own row falls back to "-" while AAPL's fills.
+        out = _render(
+            build_display_group(
+                [self._summary("AAPL"), self._summary("MSFT")], [], "USD",
+                analyst_results=self._analysts(),
+            )
+        )
+        rows = {
+            line.split()[1]: line for line in out.splitlines() if "│" in line and (
+                "AAPL" in line or "MSFT" in line
+            )
+        }
+        assert "Buy 46" in rows["AAPL"]
+        assert "+4.7%" in rows["AAPL"]
+        assert "Buy" not in rows["MSFT"]
+        assert rows["MSFT"].rstrip().rstrip("│").rstrip().endswith("-")
+
+    def test_totals_row_survives_extra_columns(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD", analyst_results=self._analysts()
+            )
+        )
+        assert "TOTAL" in out
+        assert "1,500.00" in out
+
+    def test_error_row_survives_extra_columns(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD",
+                error_symbols={"FAIL"}, holdings={"FAIL": 7},
+                analyst_results=self._analysts(),
+            )
+        )
+        assert "FAIL" in out
+        assert "error" in out
+
+    def test_missing_price_target(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD",
+                analyst_results=self._analysts(price_target=None),
+            )
+        )
+        assert "Buy 46" in out
+
+
+# ---------------------------------------------------------------------------
+# JSON payload
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSafe:
+    def test_nan_becomes_null(self):
+        assert _json_safe({"a": float("nan")}) == {"a": None}
+
+    def test_nested_containers(self):
+        assert _json_safe({"a": [1, (2, float("nan"))]}) == {"a": [1, [2, None]]}
+
+    def test_numpy_scalars_unwrapped(self):
+        value = _json_safe(pd.Series([3]).iloc[0])
+        assert value == 3
+        assert isinstance(value, int)
+
+    def test_dates_stringified(self):
+        assert _json_safe(date(2026, 1, 2)) == "2026-01-02"
+
+    def test_nat_becomes_null(self):
+        assert _json_safe(pd.NaT) is None
+
+    def test_bool_preserved(self):
+        assert _json_safe(True) is True
+
+
+class TestPortfolioPayload:
+    def _summary(self, symbol="AAPL", val_now=1500.0, val_prev=1450.0):
+        return {
+            "symbol": symbol,
+            "qty": 10,
+            "val_now": val_now,
+            "val_prev": val_prev,
+            "chg_pct": 3.45,
+            "daily_chg_val": val_now - val_prev,
+            "source_currency": "USD",
+            "conv": 1.0,
+        }
+
+    def test_shape_and_totals(self):
+        payload = portfolio_payload(
+            "EUR",
+            [self._summary("AAPL"), self._summary("MSFT", 2000.0, 1950.0)],
+            [], [], [], {},
+        )
+        assert payload["schema_version"] == JSON_SCHEMA_VERSION
+        assert payload["currency"] == "EUR"
+        assert payload["cached"] is False
+        assert payload["totals"]["value"] == pytest.approx(3500.0)
+        assert payload["totals"]["previous_value"] == pytest.approx(3400.0)
+        assert payload["totals"]["daily_change"] == pytest.approx(100.0)
+        assert payload["totals"]["daily_change_pct"] == pytest.approx(100 / 34)
+        assert [p["symbol"] for p in payload["positions"]] == ["AAPL", "MSFT"]
+
+    def test_is_strict_json(self):
+        # NaN would serialise to a bare NaN token and break strict parsers.
+        payload = portfolio_payload(
+            "USD", [self._summary(val_prev=float("nan"))], [], [], [], {},
+        )
+        assert json.loads(json.dumps(payload, allow_nan=False))
+        assert payload["positions"][0]["previous_value"] is None
+
+    def test_position_fields(self):
+        payload = portfolio_payload(
+            "USD", [self._summary()], [], [], [], {"AAPL": 5.25},
+            analysts={"AAPL": {"consensus": "Buy"}},
+        )
+        position = payload["positions"][0]
+        assert position["status"] == "ok"
+        assert position["quantity"] == 10
+        assert position["month_change_pct"] == pytest.approx(5.25)
+        assert position["fx_rate"] == 1.0
+        assert position["analysts"] == {"consensus": "Buy"}
+
+    def test_stale_and_errored_positions(self):
+        payload = portfolio_payload(
+            "USD", [self._summary("AAPL")], [], [], [], {},
+            failed=["AAPL", "GONE"], holdings={"AAPL": 10, "GONE": 3},
+        )
+        by_symbol = {p["symbol"]: p for p in payload["positions"]}
+        assert by_symbol["AAPL"]["status"] == "stale"
+        assert by_symbol["AAPL"]["value"] == 1500.0
+        assert by_symbol["GONE"]["status"] == "error"
+        assert by_symbol["GONE"]["value"] is None
+        assert by_symbol["GONE"]["quantity"] == 3
+
+    def test_month_change_from_history(self):
+        payload = portfolio_payload(
+            "USD", [self._summary()], [], [], [100.0, 110.0], {},
+        )
+        assert payload["totals"]["month_change_pct"] == pytest.approx(10.0)
+
+    def test_month_change_none_without_history(self):
+        payload = portfolio_payload("USD", [self._summary()], [], [], [], {})
+        assert payload["totals"]["month_change_pct"] is None
+
+    def test_dividends_serialised_and_sorted(self):
+        divs = [
+            {"symbol": "B", "ex_date": date(2099, 6, 15), "amt": 1.0, "total_p": 10.0},
+            {"symbol": "A", "ex_date": date(2099, 1, 5), "amt": 2.0, "total_p": 20.0},
+        ]
+        payload = portfolio_payload("USD", [], divs, [], [], {})
+        assert [d["ex_date"] for d in payload["dividends"]] == [
+            "2099-01-05", "2099-06-15",
+        ]
+
+    def test_cached_metadata(self):
+        payload = portfolio_payload(
+            "USD", [], [], [], [], {}, cached=True, cache_age=42,
+        )
+        assert payload["cached"] is True
+        assert payload["cache_age_seconds"] == 42
+
+    def test_generated_at_injectable(self):
+        stamp = datetime(2026, 8, 2, 12, 0, tzinfo=ZoneInfo("UTC"))
+        payload = portfolio_payload("USD", [], [], [], [], {}, generated_at=stamp)
+        assert payload["generated_at"].startswith("2026-08-02T12:00:00")
+
+    def test_empty_portfolio(self):
+        payload = portfolio_payload("USD", [], [], [], [], {})
+        assert payload["positions"] == []
+        assert payload["totals"]["value"] == 0.0
+        assert payload["totals"]["daily_change_pct"] == 0.0
+
+
+class TestCollectPortfolio:
+    def _patch_fetches(self, mocker, summaries=None, aux=None):
+        summaries = summaries if summaries is not None else {
+            "AAPL": {
+                "symbol": "AAPL", "qty": 10, "val_now": 1500.0, "val_prev": 1450.0,
+                "chg_pct": 3.4, "daily_chg_val": 50.0, "source_currency": "USD",
+                "conv": 1.0, "ticker_obj": object(),
+            }
+        }
+        mocker.patch(
+            "stock.fetch_summaries",
+            return_value=(summaries, {"AAPL": "USD"}, []),
+        )
+        mocker.patch("stock.fetch_auxiliary", return_value=aux if aux is not None else {
+            "history": [100.0, 110.0],
+            "monthly": {"AAPL": 5.0},
+            "traded": {"AAPL"},
+            "dividends": {},
+            "news": [],
+            "analysts": {"AAPL": {"consensus": "Buy", "analyst_count": 46}},
+        })
+
+    def test_fresh_fetch(self, mocker, tmp_path):
+        self._patch_fetches(mocker)
+        payload = collect_portfolio(
+            {"AAPL": 10}, "USD", cache_path=tmp_path / "c.json"
+        )
+        assert payload["cached"] is False
+        assert payload["positions"][0]["analysts"]["consensus"] == "Buy"
+        assert payload["totals"]["month_change_pct"] == pytest.approx(10.0)
+
+    def test_result_is_cached_for_next_run(self, mocker, tmp_path):
+        path = tmp_path / "c.json"
+        self._patch_fetches(mocker)
+        collect_portfolio({"AAPL": 10}, "USD", cache_path=path)
+
+        cached = load_cached_portfolio({"AAPL": 10}, "USD", ttl=60, path=path)
+        assert cached is not None
+        assert cached["analysts"]["AAPL"]["consensus"] == "Buy"
+
+    def test_cache_hit_skips_network(self, mocker, tmp_path):
+        path = tmp_path / "c.json"
+        save_cached_portfolio(
+            {"AAPL": 10}, "USD",
+            [{"symbol": "AAPL", "qty": 10, "val_now": 1.0, "val_prev": 1.0,
+              "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "USD",
+              "conv": 1.0}],
+            [], [], [], {}, path=path, analysts={"AAPL": {"consensus": "Hold"}},
+        )
+        summaries = mocker.patch("stock.fetch_summaries")
+
+        payload = collect_portfolio(
+            {"AAPL": 10}, "USD", cache_ttl=600, cache_path=path
+        )
+        assert payload["cached"] is True
+        assert payload["positions"][0]["analysts"]["consensus"] == "Hold"
+        summaries.assert_not_called()
+
+    def test_analysts_can_be_disabled(self, mocker, tmp_path):
+        self._patch_fetches(mocker, aux={"dividends": {}, "news": []})
+        payload = collect_portfolio(
+            {"AAPL": 10}, "USD", want_analysts=False, cache_path=tmp_path / "c.json"
+        )
+        assert payload["positions"][0]["analysts"] is None
+        from stock import fetch_auxiliary as patched
+        assert patched.call_args.kwargs["want_analysts"] is False
+
+    def test_empty_portfolio_does_not_write_cache(self, mocker, tmp_path):
+        path = tmp_path / "c.json"
+        self._patch_fetches(mocker, summaries={}, aux={})
+        payload = collect_portfolio({}, "USD", cache_path=path)
+        assert payload["positions"] == []
+        assert not path.exists()
+
+
+# ---------------------------------------------------------------------------
+# config path resolution
+# ---------------------------------------------------------------------------
+
+
+class TestResolveConfigPath:
+    def test_explicit_arg_wins(self, monkeypatch):
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", "/from/env.yaml")
+        assert resolve_config_path("/explicit.yaml") == Path("/explicit.yaml")
+
+    def test_env_var_used(self, monkeypatch):
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", "/from/env.yaml")
+        assert resolve_config_path() == Path("/from/env.yaml")
+
+    def test_falls_back_to_default(self, monkeypatch):
+        monkeypatch.delenv("STOCK_PRICE_CONFIG", raising=False)
+        assert resolve_config_path() == DEFAULT_CONFIG_PATH
+
+
+# ---------------------------------------------------------------------------
+# reading and writing the config document
+# ---------------------------------------------------------------------------
+
+
+COMMENTED_CONFIG = """\
+# My portfolio
+holdings:
+  SVOL-B.ST: 8367   # Swedish investment company
+  AAPL: 10          # bought 2024
+currency: EUR
+"""
+
+
+@pytest.fixture
+def config_file(tmp_path, monkeypatch):
+    path = tmp_path / "stock.yaml"
+    path.write_text(COMMENTED_CONFIG)
+    monkeypatch.setenv("STOCK_PRICE_CONFIG", str(path))
+    return path
+
+
+class TestReadConfigDocument:
+    def test_reads_holdings(self, config_file):
+        document, path = read_config_document()
+        assert path == config_file
+        assert dict(document["holdings"]) == {"SVOL-B.ST": 8367, "AAPL": 10}
+        assert document["currency"] == "EUR"
+
+    def test_missing_file_is_empty_not_defaults(self, tmp_path, monkeypatch):
+        # load_config() falls back to the demo holdings; writing those out
+        # would add six positions the user never owned.
+        missing = tmp_path / "nope.yaml"
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", str(missing))
+        document, _ = read_config_document()
+        assert dict(document["holdings"]) == {}
+        assert set(DEFAULT_HOLDINGS) - set(document["holdings"]) == set(DEFAULT_HOLDINGS)
+
+    def test_empty_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "empty.yaml"
+        path.write_text("\n  \n")
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", str(path))
+        document, _ = read_config_document()
+        assert dict(document["holdings"]) == {}
+
+    def test_null_holdings_key(self, tmp_path, monkeypatch):
+        path = tmp_path / "null.yaml"
+        path.write_text("holdings:\ncurrency: USD\n")
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", str(path))
+        document, _ = read_config_document()
+        assert dict(document["holdings"]) == {}
+
+    def test_non_mapping_rejected(self, tmp_path, monkeypatch):
+        path = tmp_path / "list.yaml"
+        path.write_text("- one\n- two\n")
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", str(path))
+        with pytest.raises(ValueError, match="YAML mapping"):
+            read_config_document()
+
+
+class TestWriteConfigDocument:
+    def test_creates_backup(self, config_file):
+        document, path = read_config_document()
+        document["holdings"]["AAPL"] = 99
+        write_config_document(document, path)
+        backup = path.with_name(path.name + ".bak")
+        assert backup.exists()
+        assert backup.read_text() == COMMENTED_CONFIG
+
+    def test_no_temp_file_left_behind(self, config_file):
+        document, path = read_config_document()
+        write_config_document(document, path)
+        assert not path.with_name(path.name + ".tmp").exists()
+
+    def test_output_reloads(self, config_file):
+        document, path = read_config_document()
+        document["holdings"]["MC.PA"] = 45
+        write_config_document(document, path)
+        assert load_config(str(path))["holdings"]["MC.PA"] == 45
+
+    def test_refuses_to_write_unloadable_config(self, config_file):
+        document, path = read_config_document()
+        del document["holdings"]
+        with pytest.raises(ValueError, match="would not load back"):
+            write_config_document(document, path)
+        # The real file is untouched.
+        assert path.read_text() == COMMENTED_CONFIG
+
+    def test_creates_parent_directory(self, tmp_path):
+        path = tmp_path / "nested" / "dir" / "stock.yaml"
+        write_config_document({"holdings": {"AAPL": 1}, "currency": "USD"}, path)
+        assert load_config(str(path))["holdings"] == {"AAPL": 1}
+
+
+# ---------------------------------------------------------------------------
+# editing holdings
+# ---------------------------------------------------------------------------
+
+
+class TestSetHolding:
+    def test_updates_existing(self, config_file):
+        result = set_holding("AAPL", 25)
+        assert result["action"] == "updated"
+        assert result["previous_quantity"] == 10
+        assert result["quantity"] == 25
+        assert load_config(str(config_file))["holdings"]["AAPL"] == 25
+
+    def test_adds_new(self, config_file):
+        result = set_holding("MC.PA", 45)
+        assert result["action"] == "added"
+        assert result["previous_quantity"] is None
+        assert load_config(str(config_file))["holdings"]["MC.PA"] == 45
+
+    def test_matches_existing_key_case_insensitively(self, config_file):
+        result = set_holding("aapl", 25)
+        assert result["symbol"] == "AAPL"
+        holdings = load_config(str(config_file))["holdings"]
+        assert holdings["AAPL"] == 25
+        assert "aapl" not in holdings
+
+    def test_whole_numbers_stored_as_int(self, config_file):
+        # 25.0 would otherwise land in the YAML as "25.0", which reads oddly
+        # for a share count.
+        set_holding("AAPL", 25.0)
+        assert "AAPL: 25" in config_file.read_text()
+        assert "25.0" not in config_file.read_text()
+        assert isinstance(load_config(str(config_file))["holdings"]["AAPL"], int)
+
+    def test_fractional_shares_allowed(self, config_file):
+        set_holding("AAPL", 2.5)
+        assert load_config(str(config_file))["holdings"]["AAPL"] == 2.5
+
+    @pytest.mark.parametrize("quantity", [0, -5])
+    def test_non_positive_rejected(self, config_file, quantity):
+        with pytest.raises(ValueError, match="must be positive"):
+            set_holding("AAPL", quantity)
+        assert config_file.read_text() == COMMENTED_CONFIG
+
+    def test_empty_symbol_rejected(self, config_file):
+        with pytest.raises(ValueError):
+            set_holding("   ", 5)
+
+
+class TestAddShares:
+    def test_adds_to_existing(self, config_file):
+        result = add_shares("AAPL", 5)
+        assert result["previous_quantity"] == 10
+        assert result["quantity"] == 15
+        assert result["delta"] == 5
+        assert result["action"] == "updated"
+
+    def test_creates_when_new(self, config_file):
+        result = add_shares("MC.PA", 45)
+        assert result["action"] == "added"
+        assert result["quantity"] == 45
+
+    def test_subtracts_after_partial_sale(self, config_file):
+        result = add_shares("AAPL", -4)
+        assert result["quantity"] == 6
+        assert load_config(str(config_file))["holdings"]["AAPL"] == 6
+
+    def test_selling_everything_removes_the_holding(self, config_file):
+        result = add_shares("AAPL", -10)
+        assert result["action"] == "removed"
+        assert "AAPL" not in load_config(str(config_file))["holdings"]
+
+    def test_oversell_rejected(self, config_file):
+        with pytest.raises(ValueError, match="cannot subtract"):
+            add_shares("AAPL", -11)
+        assert config_file.read_text() == COMMENTED_CONFIG
+
+    def test_zero_rejected(self, config_file):
+        with pytest.raises(ValueError, match="must not be zero"):
+            add_shares("AAPL", 0)
+
+
+class TestRemoveHolding:
+    def test_removes(self, config_file):
+        result = remove_holding("AAPL")
+        assert result["action"] == "removed"
+        assert result["previous_quantity"] == 10
+        assert "AAPL" not in load_config(str(config_file))["holdings"]
+
+    def test_unknown_symbol_rejected(self, config_file):
+        with pytest.raises(KeyError):
+            remove_holding("MSFT")
+        assert config_file.read_text() == COMMENTED_CONFIG
+
+
+@pytest.mark.skipif(not PRESERVES_COMMENTS, reason="ruamel.yaml not installed")
+class TestCommentPreservation:
+    def test_comments_and_order_survive_an_edit(self, config_file):
+        add_shares("AAPL", 5)
+        text = config_file.read_text()
+        assert "# My portfolio" in text
+        assert "# Swedish investment company" in text
+        assert "# bought 2024" in text
+        # Key order is unchanged: SVOL-B.ST still precedes AAPL.
+        assert text.index("SVOL-B.ST") < text.index("AAPL")
+
+    def test_new_holding_appended_without_disturbing_others(self, config_file):
+        set_holding("MC.PA", 45)
+        text = config_file.read_text()
+        assert "SVOL-B.ST: 8367   # Swedish investment company" in text
+        assert "MC.PA: 45" in text
+
+
+# ---------------------------------------------------------------------------
+# resolve_symbol
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSymbol:
+    def test_known_symbol(self, mocker):
+        ticker = MagicMock()
+        ticker.info = {"shortName": "Apple Inc."}
+        mocker.patch(
+            "stock._fast_quote",
+            return_value=(ticker, {"currency": "USD"}, 200.0),
+        )
+        result = resolve_symbol("aapl")
+        assert result == {
+            "symbol": "AAPL", "status": "ok", "name": "Apple Inc.",
+            "price": 200.0, "currency": "USD",
+        }
+
+    def test_priceless_symbol_is_unknown(self, mocker):
+        mocker.patch("stock._fast_quote", return_value=(MagicMock(), {}, None))
+        assert resolve_symbol("AAPL")["status"] == "unknown"
+
+    def test_lookup_error_with_service_up_is_unknown(self, mocker):
+        # A typo raises out of fast_info exactly like an outage does, so the
+        # sentinel probe is what tells the two apart.
+        mocker.patch("stock._fast_quote", side_effect=KeyError("exchangeTimezoneName"))
+        mocker.patch("stock._price_service_reachable", return_value=True)
+        assert resolve_symbol("NOPE")["status"] == "unknown"
+
+    def test_lookup_error_with_service_down_is_unverified(self, mocker):
+        mocker.patch("stock._fast_quote", side_effect=OSError("network down"))
+        mocker.patch("stock._price_service_reachable", return_value=False)
+        assert resolve_symbol("AAPL")["status"] == "unverified"
+
+    def test_name_lookup_failure_is_not_fatal(self, mocker):
+        ticker = MagicMock()
+        type(ticker).info = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("429"))
+        )
+        mocker.patch(
+            "stock._fast_quote", return_value=(ticker, {"currency": "USD"}, 5.0)
+        )
+        result = resolve_symbol("AAPL")
+        assert result["status"] == "ok"
+        assert result["name"] is None
+
+    def test_empty_symbol_rejected(self):
+        with pytest.raises(ValueError):
+            resolve_symbol("  ")
+
+
+class TestPriceServiceReachable:
+    def test_true_when_sentinel_prices(self, mocker):
+        mocker.patch("stock._fast_quote", return_value=(MagicMock(), {}, 100.0))
+        assert _price_service_reachable() is True
+
+    def test_false_when_sentinel_raises(self, mocker):
+        mocker.patch("stock._fast_quote", side_effect=OSError("down"))
+        assert _price_service_reachable() is False
+
+    def test_false_when_sentinel_has_no_price(self, mocker):
+        mocker.patch("stock._fast_quote", return_value=(MagicMock(), {}, None))
+        assert _price_service_reachable() is False
+
+
+class TestAnalystView:
+    def test_returns_none_for_unknown_symbol(self, mocker):
+        mocker.patch(
+            "stock.resolve_symbol",
+            return_value={"symbol": "NOPE", "status": "unknown", "currency": None},
+        )
+        assert analyst_view("NOPE") is None
+
+    def test_wraps_instrument_and_analysts(self, mocker):
+        mocker.patch(
+            "stock.resolve_symbol",
+            return_value={"symbol": "AAPL", "status": "ok", "currency": "USD"},
+        )
+        mocker.patch("stock.yf.Ticker", return_value=MagicMock())
+        mocker.patch("stock.get_analyst_data", return_value={"consensus": "Buy"})
+        view = analyst_view("AAPL")
+        assert view["instrument"]["symbol"] == "AAPL"
+        assert view["analysts"] == {"consensus": "Buy"}
+
+    def test_unverified_symbol_still_attempted(self, mocker):
+        mocker.patch(
+            "stock.resolve_symbol",
+            return_value={"symbol": "AAPL", "status": "unverified", "currency": None},
+        )
+        mocker.patch("stock.yf.Ticker", return_value=MagicMock())
+        mocker.patch("stock.get_analyst_data", return_value=None)
+        assert analyst_view("AAPL")["analysts"] is None
