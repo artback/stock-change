@@ -160,6 +160,36 @@ def holding_quantity(entry):
     return entry
 
 
+def holding_cost(entry):
+    """Read the per-share cost basis out of a holdings entry, if it has one."""
+    if isinstance(entry, dict):
+        cost = entry.get("cost", entry.get("cost_basis"))
+        if cost is not None:
+            try:
+                return float(cost)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def blend_cost(held_qty, held_cost, bought_qty, bought_cost):
+    """Weighted-average cost basis after buying more of something.
+
+    Buying 10 at 200 on top of 10 at 100 leaves an average of 150, not 200.
+    Returns ``None`` when there is nothing to blend, so the caller can leave
+    any recorded basis alone.
+    """
+    if bought_cost is None or bought_qty <= 0:
+        return None
+    if not held_qty or held_cost is None:
+        return bought_cost
+    total = held_qty + bought_qty
+    if total <= 0:
+        return bought_cost
+    # Rounded so the config doesn't fill up with float noise like 226.79999999.
+    return round(((held_qty * held_cost) + (bought_qty * bought_cost)) / total, 6)
+
+
 def parse_holdings(raw):
     """Split a holdings mapping into quantities and per-share cost basis.
 
@@ -456,7 +486,14 @@ def set_holding(symbol, quantity, config_path=None, cost=None):
 
 
 def add_shares(symbol, quantity, config_path=None, cost=None):
-    """Add to (or, with a negative quantity, subtract from) a holding."""
+    """Add to (or, with a negative quantity, subtract from) a holding.
+
+    ``cost`` is the per-share price paid on *this* purchase. It is blended
+    into the existing basis as a weighted average rather than replacing it —
+    buying more at a higher price raises your average cost, it does not reset
+    it. On a sale the recorded basis is left untouched, which is what
+    average-cost accounting does.
+    """
     delta = _normalise_quantity(quantity)
     if delta == 0:
         raise ValueError("quantity must not be zero")
@@ -471,10 +508,14 @@ def add_shares(symbol, quantity, config_path=None, cost=None):
         if total == 0:
             holdings.pop(key, None)
             return {"quantity": 0, "delta": delta, "action": "removed"}
-        _store_holding(holdings, key, total, cost)
+
+        new_cost = blend_cost(
+            previous or 0, holding_cost(holdings.get(key)), delta, cost
+        )
+        _store_holding(holdings, key, total, new_cost)
         return {
             "quantity": total,
-            "cost": cost,
+            "cost": new_cost if new_cost is not None else holding_cost(holdings.get(key)),
             "delta": delta,
             "action": "updated" if previous is not None else "added",
         }

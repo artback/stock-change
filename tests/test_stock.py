@@ -33,6 +33,7 @@ from stock import (
     add_shares,
     analyst_view,
     apply_holiday_zeroing,
+    blend_cost,
     build_display_group,
     collect_portfolio,
     consensus_label,
@@ -47,6 +48,7 @@ from stock import (
     get_news_data,
     get_rate,
     get_ticker_summary,
+    holding_cost,
     holding_quantity,
     is_any_market_open,
     load_cached_portfolio,
@@ -2926,3 +2928,109 @@ class TestFitColumns:
             console.print(table)
         rendered = max(len(ln.rstrip()) for ln in cap.get().splitlines())
         assert _table_width(columns) == rendered
+
+
+# ---------------------------------------------------------------------------
+# averaging the cost basis across purchases
+# ---------------------------------------------------------------------------
+
+
+class TestHoldingCost:
+    def test_mapping(self):
+        assert holding_cost({"qty": 10, "cost": 185.2}) == 185.2
+
+    def test_alias(self):
+        assert holding_cost({"qty": 10, "cost_basis": 12.5}) == 12.5
+
+    def test_bare_entry_has_none(self):
+        assert holding_cost(10) is None
+
+    def test_missing_and_unparseable(self):
+        assert holding_cost({"qty": 10}) is None
+        assert holding_cost({"qty": 10, "cost": "abc"}) is None
+
+
+class TestBlendCost:
+    def test_weighted_average(self):
+        assert blend_cost(10, 100.0, 10, 200.0) == 150.0
+
+    def test_weights_by_size(self):
+        # 30 at 100 plus 10 at 200 is 125, not 150.
+        assert blend_cost(30, 100.0, 10, 200.0) == 125.0
+
+    def test_first_purchase_uses_the_price_paid(self):
+        assert blend_cost(0, None, 10, 185.2) == 185.2
+
+    def test_existing_position_without_a_basis(self):
+        assert blend_cost(10, None, 5, 50.0) == 50.0
+
+    def test_no_price_leaves_the_basis_alone(self):
+        assert blend_cost(10, 100.0, 10, None) is None
+
+    def test_sales_do_not_reprice(self):
+        assert blend_cost(10, 100.0, -5, 200.0) is None
+
+    def test_rounded_to_avoid_float_noise(self):
+        # (10*185.20 + 5*310) / 15 = 226.8 exactly; without rounding this
+        # lands as 226.79999999999998 in the config file.
+        assert blend_cost(10, 185.20, 5, 310.0) == 226.8
+
+
+class TestAddSharesAveragesCost:
+    """Regression cover for a bug shipped in 0.7.0.
+
+    ``add_shares(..., cost=X)`` replaced the average cost instead of blending
+    it, so buying more at a different price silently corrupted the reported
+    profit and loss for the whole position.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path, monkeypatch):
+        path = tmp_path / "avg.yaml"
+        path.write_text(
+            "holdings:\n  AAPL:\n    qty: 10\n    cost: 100.0\n  BARE: 5\ncurrency: EUR\n"
+        )
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", str(path))
+        return path
+
+    def _cost(self, config, symbol="AAPL"):
+        return load_config(str(config))["cost_basis"].get(symbol)
+
+    def test_buying_higher_raises_the_average(self, config):
+        result = add_shares("AAPL", 10, cost=200.0)
+        assert result["cost"] == 150.0
+        assert self._cost(config) == 150.0
+
+    def test_buying_lower_lowers_the_average(self, config):
+        add_shares("AAPL", 10, cost=50.0)
+        assert self._cost(config) == 75.0
+
+    def test_buying_without_a_price_keeps_the_average(self, config):
+        add_shares("AAPL", 10)
+        assert self._cost(config) == 100.0
+
+    def test_selling_does_not_change_the_average(self, config):
+        add_shares("AAPL", -5)
+        assert self._cost(config) == 100.0
+
+    def test_a_price_passed_on_a_sale_is_ignored(self, config):
+        add_shares("AAPL", -5, cost=999.0)
+        assert self._cost(config) == 100.0
+
+    def test_cost_can_be_introduced_to_a_bare_holding(self, config):
+        add_shares("BARE", 5, cost=50.0)
+        assert self._cost(config, "BARE") == 50.0
+
+    def test_a_brand_new_holding_takes_the_price_paid(self, config):
+        add_shares("MSFT", 3, cost=400.0)
+        assert self._cost(config, "MSFT") == 400.0
+
+    def test_successive_purchases_compound_correctly(self, config):
+        add_shares("AAPL", 10, cost=200.0)   # 20 @ 150
+        add_shares("AAPL", 20, cost=300.0)   # 40 @ 225
+        assert self._cost(config) == 225.0
+
+    def test_set_holding_still_replaces(self, config):
+        # set_holding means "this is the position", so replacing is right.
+        set_holding("AAPL", 20, cost=42.0)
+        assert self._cost(config) == 42.0

@@ -73,6 +73,11 @@ holdings:
 currency: EUR
 ```
 
+When you buy more, `add_shares` blends the price you paid into a weighted
+average — 10 at 100 plus 10 at 200 becomes 20 at 150, not 20 at 200. Selling
+leaves the average untouched. `set_holding` replaces it outright, since that
+means "this is the position".
+
 `cost` is per share in the **ticker's own currency**, the way a contract note
 reads. Returns are therefore computed in that currency and exclude any FX
 movement since you bought: converting a historical cost at today's rate would

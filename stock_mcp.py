@@ -172,9 +172,11 @@ def add_shares(
         symbol: Ticker, e.g. "AAPL".
         quantity: Shares to add; negative to subtract. Reaching exactly zero
             removes the holding.
-        cost: Price paid per share on this purchase, in the ticker's own
-            currency. Recording it is what lets the portfolio report profit
-            and loss. Omit to leave any existing cost basis untouched.
+        cost: Price paid per share on THIS purchase, in the ticker's own
+            currency — not the new average. It is blended into the existing
+            basis as a weighted average, so buying more at a higher price
+            raises the average rather than replacing it. Ignored on a sale.
+            Omit to leave the recorded basis untouched.
     """
     return _write_holding(symbol, lambda s: stock.add_shares(s, quantity, cost=cost))
 
