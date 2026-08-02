@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 from rich.console import Console
+from rich.table import Table
 
+import stock as stock_module
 from stock import (
     CURRENCY_SYMBOLS,
     DEFAULT_CONFIG_PATH,
@@ -20,12 +22,14 @@ from stock import (
     MIN_RECORDED_HISTORY_POINTS,
     PRESERVES_COMMENTS,
     _consensus_trend,
+    _fit_columns,
     _get_exchange_suffix,
     _has_market_activity,
     _json_safe,
     _price_service_reachable,
     _retry,
     _score_ratings,
+    _table_width,
     add_shares,
     analyst_view,
     apply_holiday_zeroing,
@@ -65,6 +69,16 @@ from stock import (
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _fixed_console_width(monkeypatch):
+    """Pin the console width so column shedding is deterministic.
+
+    Under pytest the module console is 80 wide, but the helpers below render
+    at 120 — without this the two disagree and columns vanish unexpectedly.
+    """
+    monkeypatch.setattr(stock_module, "console", Console(width=120))
+
 
 def _render(group):
     c = Console(width=120)
@@ -2749,3 +2763,166 @@ class TestDividendIncomeTable:
         # only the position that actually has a cost basis.
         assert cells[-2] == "20.00%"
         assert cells[-1] == "10.00%"
+
+
+# ---------------------------------------------------------------------------
+# responsive tables
+# ---------------------------------------------------------------------------
+
+
+def _render_at(group, width):
+    console = Console(width=width)
+    with console.capture() as cap:
+        console.print(group)
+    return cap.get()
+
+
+def _headers(out, contains="Ticker"):
+    """The header row of a table, so assertions don't match the footer's
+    "hidden: ..." list, which names the very columns that were dropped."""
+    return next(ln for ln in out.splitlines() if contains in ln and "┃" in ln)
+
+
+class TestResponsiveTable:
+    def _summary(self, symbol="AAPL", value=1500.0):
+        return {
+            "symbol": symbol, "qty": 10, "val_now": value, "val_prev": value,
+            "chg_pct": 1.5, "daily_chg_val": 20.0, "source_currency": "USD",
+            "conv": 1.0, "price": 150.0, "cost": 100.0, "cost_value": 1000.0,
+            "unrealized": 500.0, "return_pct": 50.0,
+        }
+
+    def _analysts(self):
+        return {
+            "AAPL": {
+                "consensus": "Strong Buy", "trend": "up", "analyst_count": 46,
+                "price_target": {"upside_pct": 19.8},
+            }
+        }
+
+    def _group(self, width):
+        return build_display_group(
+            [self._summary()], [], "USD",
+            analyst_results=self._analysts(), max_width=width,
+        )
+
+    @pytest.mark.parametrize("width", [80, 100, 120, 140, 200])
+    def test_never_truncates(self, width):
+        # Rich squeezes every column at once when the table is too wide, which
+        # turns figures into "+66.8…". Shedding columns must prevent that.
+        out = _render_at(self._group(width), width)
+        assert "…" not in out
+
+    @pytest.mark.parametrize("width", [80, 100, 120, 140, 200])
+    def test_essentials_always_survive(self, width):
+        out = _render_at(self._group(width), width)
+        assert "AAPL" in out
+        assert "Value" in out
+        assert "Day %" in out
+        assert "1,500.00" in out
+
+    def test_wide_terminal_keeps_everything(self):
+        headers = _headers(_render_at(self._group(200), 200))
+        for header in ("Quantity", "Daily", "Month %", "P/L", "Return %",
+                       "Analysts", "Target"):
+            assert header in headers, header
+
+    def test_narrower_terminals_show_no_more_columns(self):
+        counts = []
+        for width in (80, 100, 120, 140, 200):
+            out = _render_at(self._group(width), width)
+            header = next(ln for ln in out.splitlines() if "Ticker" in ln)
+            counts.append(header.count("┃") - 1)
+        assert counts == sorted(counts), counts
+
+    def test_returns_outlive_analysts(self):
+        # Cost basis is opt-in, so if the user recorded it they want to see it
+        # more than they want third-party opinions.
+        out = _render_at(self._group(100), 100)
+        headers = _headers(out)
+        assert "Return %" in headers
+        assert "Target" not in headers
+
+    def test_dropped_columns_are_named_in_the_footer(self):
+        out = _render_at(self._group(100), 100)
+        assert "narrow terminal" in out
+        assert "Quantity" in out.split("narrow terminal")[1]
+
+    def test_no_footer_note_when_nothing_is_dropped(self):
+        out = _render_at(self._group(200), 200)
+        assert "narrow terminal" not in out
+
+    def test_footer_note_appends_to_existing_text(self):
+        group = build_display_group(
+            [self._summary()], [], "USD", "Last update: 12:00:00",
+            analyst_results=self._analysts(), max_width=100,
+        )
+        out = _render_at(group, 100)
+        assert "Last update: 12:00:00" in out
+        assert "narrow terminal" in out
+
+    def test_dividends_table_also_sheds(self):
+        dividends = [{
+            "symbol": "AAPL", "ex_date": date(2099, 6, 15), "amt": 1.0,
+            "total_p": 10.0, "cur_label": "$", "ttm_per_share": 4.0,
+            "ttm_total": 40.0, "yield_pct": 2.0, "yield_on_cost_pct": 4.0,
+        }]
+        wide = _render_at(
+            build_display_group([self._summary()], dividends, "USD", max_width=200),
+            200,
+        )
+        narrow = _render_at(
+            build_display_group([self._summary()], dividends, "USD", max_width=80),
+            80,
+        )
+        assert "Amount" in _headers(wide, "Ex-Date")
+        assert "Amount" not in _headers(narrow, "Ex-Date")
+        assert "…" not in narrow
+        # The income figure is the point of the table; it must never be shed.
+        assert "12M Income" in _headers(narrow, "Ex-Date")
+        assert "40.00" in narrow
+
+
+class TestFitColumns:
+    def _cols(self):
+        return [
+            {"key": "a", "header": "A", "width": 10},
+            {"key": "b", "header": "B", "width": 10},
+            {"key": "c", "header": "C", "width": 10},
+        ]
+
+    def test_keeps_everything_when_it_fits(self):
+        visible, dropped = _fit_columns(self._cols(), 500, ("b", "c"))
+        assert len(visible) == 3
+        assert dropped == []
+
+    def test_sheds_in_the_given_order(self):
+        visible, dropped = _fit_columns(self._cols(), 30, ("c", "b"))
+        assert dropped == ["C"]
+        assert [c["key"] for c in visible] == ["a", "b"]
+
+    def test_stops_once_it_fits(self):
+        _, dropped = _fit_columns(self._cols(), 30, ("c", "b", "a"))
+        assert len(dropped) == 1
+
+    def test_never_drops_a_column_absent_from_the_order(self):
+        visible, _ = _fit_columns(self._cols(), 1, ("b", "c"))
+        assert [c["key"] for c in visible] == ["a"]
+
+    def test_unknown_available_width_keeps_everything(self):
+        visible, dropped = _fit_columns(self._cols(), None, ("b", "c"))
+        assert len(visible) == 3
+        assert dropped == []
+
+    def test_width_matches_what_rich_renders(self):
+        # The shedding decision is only as good as this estimate.
+        columns = self._cols()
+        table = Table()
+        for column in columns:
+            table.add_column(column["header"], width=column["width"], no_wrap=True)
+        table.add_row("x", "y", "z")
+        console = Console(width=500)
+        with console.capture() as cap:
+            console.print(table)
+        rendered = max(len(ln.rstrip()) for ln in cap.get().splitlines())
+        assert _table_width(columns) == rendered

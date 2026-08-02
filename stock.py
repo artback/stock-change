@@ -1710,6 +1710,45 @@ def collect_portfolio(
     return payload
 
 
+# The order columns are given up in when the terminal is too narrow. Rich
+# would otherwise squeeze every column at once and truncate the figures to
+# "+66.8…", which loses the numbers and looks broken; shedding the least
+# informative columns keeps the rest readable.
+#
+# Summary keeps the ticker, what it is worth and how it moved today. Dividends
+# keeps the ticker, the next date and the income actually received.
+_SUMMARY_SHED_ORDER = ("daily_value", "quantity", "target", "pl", "analysts", "month")
+_DIVIDEND_SHED_ORDER = ("amount", "on_cost", "yield", "next")
+
+
+def _table_width(columns):
+    """Rendered width of a Rich table with these column widths."""
+    # One space of padding either side of every cell, plus the vertical rules
+    # (one between each pair of columns, plus the two outer edges).
+    return sum(c["width"] for c in columns) + 2 * len(columns) + len(columns) + 1
+
+
+def _fit_columns(columns, available, shed_order):
+    """Drop optional columns, least useful first, until the table fits.
+
+    Returns ``(visible_columns, dropped_headers)`` so the caller can tell the
+    user what is missing rather than hiding it silently.
+    """
+    visible = list(columns)
+    dropped = []
+    if not available:
+        return visible, dropped
+    for key in shed_order:
+        if _table_width(visible) <= available:
+            break
+        match = next((c for c in visible if c["key"] == key), None)
+        if match is None:
+            continue
+        visible.remove(match)
+        dropped.append(match["header"])
+    return visible, dropped
+
+
 def _return_cells(summary, target_symbol):
     """Render the (unrealized P/L, return %) cells for one holding."""
     unrealized = summary.get("unrealized")
@@ -1763,6 +1802,7 @@ def build_display_group(
     analyst_results=None,
     benchmark=None,
     portfolio_history=None,
+    max_width=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     monthly_changes = monthly_changes or {}
@@ -1774,29 +1814,59 @@ def build_display_group(
     show_returns = any(s.get("return_pct") is not None for s in summary_results)
 
     # 1. Summary Table (No expand=True to keep it compact)
+    wanted = [
+        {"key": "ticker", "header": "Ticker", "width": 12, "justify": "left"},
+        {"key": "quantity", "header": "Quantity", "width": 10, "justify": "right"},
+        {
+            "key": "value",
+            "header": f"Value ({target_symbol})",
+            "width": 15,
+            "justify": "right",
+            "style": "bold white",
+        },
+        {
+            "key": "daily_value",
+            "header": f"Daily ({target_symbol})",
+            "width": 12,
+            "justify": "right",
+        },
+        {"key": "day", "header": "Day %", "width": 9, "justify": "right"},
+        {"key": "month", "header": "Month %", "width": 9, "justify": "right"},
+    ]
+    if show_returns:
+        wanted += [
+            {
+                "key": "pl",
+                "header": f"P/L ({target_symbol})",
+                "width": 14,
+                "justify": "right",
+            },
+            {"key": "return", "header": "Return %", "width": 9, "justify": "right"},
+        ]
+    if show_analysts:
+        wanted += [
+            {"key": "analysts", "header": "Analysts", "width": 15, "justify": "right"},
+            {"key": "target", "header": "Target", "width": 8, "justify": "right"},
+        ]
+
+    available = max_width if max_width is not None else console.width
+    columns, dropped_columns = _fit_columns(wanted, available, _SUMMARY_SHED_ORDER)
+    visible_keys = [c["key"] for c in columns]
+
     table = Table(
         title=f"Portfolio Summary ({target_currency})", header_style="bold cyan"
     )
-    table.add_column("Ticker", width=12, no_wrap=True)
-    table.add_column("Quantity", justify="right", width=10, no_wrap=True)
-    table.add_column(
-        f"Value ({target_symbol})",
-        justify="right",
-        style="bold white",
-        width=15,
-        no_wrap=True,
-    )
-    table.add_column(
-        f"Daily ({target_symbol})", justify="right", width=12, no_wrap=True
-    )
-    table.add_column("Day %", justify="right", width=9, no_wrap=True)
-    table.add_column("Month %", justify="right", width=9, no_wrap=True)
-    if show_returns:
-        table.add_column(f"P/L ({target_symbol})", justify="right", width=14, no_wrap=True)
-        table.add_column("Return %", justify="right", width=9, no_wrap=True)
-    if show_analysts:
-        table.add_column("Analysts", justify="right", width=14, no_wrap=True)
-        table.add_column("Target", justify="right", width=8, no_wrap=True)
+    for column in columns:
+        table.add_column(
+            column["header"],
+            justify=column["justify"],
+            width=column["width"],
+            style=column.get("style"),
+            no_wrap=True,
+        )
+
+    def add_row(cells):
+        table.add_row(*(cells.get(key, Text("")) for key in visible_keys))
 
     total_val = 0
     total_prev = 0
@@ -1835,26 +1905,28 @@ def build_display_group(
         else:
             ticker_cell = s["symbol"]
 
-        row = [
-            ticker_cell,
-            f"{s['qty']:,}",
-            f"{val_now:,.2f} {target_symbol}" if not pd.isna(val_now) else "-",
-            Text(
+        cells = {
+            "ticker": ticker_cell,
+            "quantity": f"{s['qty']:,}",
+            "value": f"{val_now:,.2f} {target_symbol}" if not pd.isna(val_now) else "-",
+            "daily_value": Text(
                 f"{daily_chg:+,.2f} {target_symbol}",
                 style="green" if daily_chg >= 0 else "red",
             )
             if not pd.isna(daily_chg)
             else Text("-", style="dim"),
-            Text(f"{chg_pct:+.2f}%", style="green" if chg_pct >= 0 else "red")
+            "day": Text(f"{chg_pct:+.2f}%", style="green" if chg_pct >= 0 else "red")
             if not pd.isna(chg_pct)
             else Text("-", style="dim"),
-            m_text,
-        ]
+            "month": m_text,
+        }
         if show_returns:
-            row.extend(_return_cells(s, target_symbol))
+            cells["pl"], cells["return"] = _return_cells(s, target_symbol)
         if show_analysts:
-            row.extend(_analyst_cells(analyst_results.get(s["symbol"])))
-        table.add_row(*row)
+            cells["analysts"], cells["target"] = _analyst_cells(
+                analyst_results.get(s["symbol"])
+            )
+        add_row(cells)
 
     # Tickers that have never loaded (no cached data at all) would otherwise
     # vanish entirely — show them explicitly as errored so a partial portfolio
@@ -1862,19 +1934,21 @@ def build_display_group(
     loaded = {s["symbol"] for s in summary_results}
     for sym in sorted(error_symbols - loaded):
         qty = (holdings or {}).get(sym)
-        row = [
-            Text(f"{sym} ⚠", style="red"),
-            f"{qty:,}" if isinstance(qty, (int, float)) else "",
-            Text("error", style="dim red"),
-            Text("-", style="dim"),
-            Text("-", style="dim"),
-            Text("-", style="dim"),
-        ]
-        if show_returns:
-            row.extend((Text("-", style="dim"), Text("-", style="dim")))
-        if show_analysts:
-            row.extend((Text("-", style="dim"), Text("-", style="dim")))
-        table.add_row(*row)
+        dash = Text("-", style="dim")
+        add_row(
+            {
+                "ticker": Text(f"{sym} ⚠", style="red"),
+                "quantity": f"{qty:,}" if isinstance(qty, (int, float)) else "",
+                "value": Text("error", style="dim red"),
+                "daily_value": dash,
+                "day": dash,
+                "month": dash,
+                "pl": dash,
+                "return": dash,
+                "analysts": dash,
+                "target": dash,
+            }
+        )
 
     if summary_results:
         total_chg_pct = (
@@ -1883,43 +1957,33 @@ def build_display_group(
             else 0
         )
         table.add_section()
-        total_row = [
-            Text("TOTAL", style="bold"),
-            "",
-            Text(f"{total_val:,.2f} {target_symbol}", style="bold white"),
-            Text(
+        total_cells = {
+            "ticker": Text("TOTAL", style="bold"),
+            "quantity": "",
+            "value": Text(f"{total_val:,.2f} {target_symbol}", style="bold white"),
+            "daily_value": Text(
                 f"{total_daily_chg:+,.2f} {target_symbol}",
                 style="bold green" if total_daily_chg >= 0 else "bold red",
             ),
-            Text(
+            "day": Text(
                 f"{total_chg_pct:+.2f}%",
                 style="bold green" if total_chg_pct >= 0 else "bold red",
             ),
-            Text(""),
-        ]
+            "month": Text(""),
+        }
         if show_returns:
             total_return_pct = (
                 (total_unrealized / total_cost) * 100 if total_cost else None
             )
-            total_row.extend(
-                (
-                    Text(
-                        f"{total_unrealized:+,.2f} {target_symbol}",
-                        style="bold green" if total_unrealized >= 0 else "bold red",
-                    ),
-                    Text(
-                        f"{total_return_pct:+.2f}%"
-                        if total_return_pct is not None
-                        else "",
-                        style="bold green"
-                        if (total_return_pct or 0) >= 0
-                        else "bold red",
-                    ),
-                )
+            total_cells["pl"] = Text(
+                f"{total_unrealized:+,.2f} {target_symbol}",
+                style="bold green" if total_unrealized >= 0 else "bold red",
             )
-        if show_analysts:
-            total_row.extend((Text(""), Text("")))
-        table.add_row(*total_row)
+            total_cells["return"] = Text(
+                f"{total_return_pct:+.2f}%" if total_return_pct is not None else "",
+                style="bold green" if (total_return_pct or 0) >= 0 else "bold red",
+            )
+        add_row(total_cells)
 
     # 2. Dividends Table — upcoming payouts, plus what actually arrived over
     # the trailing year. A holding can have one without the other.
@@ -1927,26 +1991,45 @@ def build_display_group(
     income = [d for d in dividend_results if d.get("ttm_total")]
     div_table = None
     if upcoming or income:
+        div_wanted = [
+            {"key": "ticker", "header": "Ticker", "width": 12, "justify": "left"},
+            {"key": "ex_date", "header": "Ex-Date", "width": 12, "justify": "center"},
+            {"key": "amount", "header": "Amount", "width": 12, "justify": "right"},
+            {
+                "key": "next",
+                "header": f"Next ({target_symbol})",
+                "width": 14,
+                "justify": "right",
+                "style": "green",
+            },
+            {
+                "key": "income",
+                "header": f"12M Income ({target_symbol})",
+                "width": 18,
+                "justify": "right",
+                "style": "green",
+            },
+            {"key": "yield", "header": "Yield", "width": 8, "justify": "right"},
+            {"key": "on_cost", "header": "On Cost", "width": 9, "justify": "right"},
+        ]
+        div_columns, div_dropped = _fit_columns(
+            div_wanted, available, _DIVIDEND_SHED_ORDER
+        )
+        div_keys = [c["key"] for c in div_columns]
+        dropped_columns.extend(div_dropped)
+
         div_table = Table(title="Dividends", header_style="bold magenta")
-        div_table.add_column("Ticker", width=12, no_wrap=True)
-        div_table.add_column("Ex-Date", justify="center", width=12, no_wrap=True)
-        div_table.add_column("Amount", justify="right", width=12, no_wrap=True)
-        div_table.add_column(
-            f"Next ({target_symbol})",
-            justify="right",
-            style="green",
-            width=14,
-            no_wrap=True,
-        )
-        div_table.add_column(
-            f"12M Income ({target_symbol})",
-            justify="right",
-            style="green",
-            width=18,
-            no_wrap=True,
-        )
-        div_table.add_column("Yield", justify="right", width=8, no_wrap=True)
-        div_table.add_column("On Cost", justify="right", width=9, no_wrap=True)
+        for column in div_columns:
+            div_table.add_column(
+                column["header"],
+                justify=column["justify"],
+                width=column["width"],
+                style=column.get("style"),
+                no_wrap=True,
+            )
+
+        def add_div_row(cells):
+            div_table.add_row(*(cells.get(key, Text("")) for key in div_keys))
 
         def _sort_key(entry):
             # Scheduled payouts first, in date order; income-only rows after.
@@ -1957,22 +2040,25 @@ def build_display_group(
                 continue
             yield_pct = d.get("yield_pct")
             on_cost = d.get("yield_on_cost_pct")
-            div_table.add_row(
-                d["symbol"],
-                str(d["ex_date"]) if d.get("ex_date") else Text("-", style="dim"),
-                f"{d['amt']:.2f} {d['cur_label']}"
-                if d.get("amt")
-                else Text("-", style="dim"),
-                f"{d['total_p']:,.2f} {target_symbol}"
-                if d.get("total_p")
-                else Text("-", style="dim"),
-                f"{d['ttm_total']:,.2f} {target_symbol}"
-                if d.get("ttm_total")
-                else Text("-", style="dim"),
-                f"{yield_pct:.2f}%" if yield_pct else Text("-", style="dim"),
-                Text(f"{on_cost:.2f}%", style="green")
-                if on_cost
-                else Text("-", style="dim"),
+            dash = Text("-", style="dim")
+            add_div_row(
+                {
+                    "ticker": d["symbol"],
+                    "ex_date": str(d["ex_date"]) if d.get("ex_date") else dash,
+                    "amount": f"{d['amt']:.2f} {d['cur_label']}"
+                    if d.get("amt")
+                    else dash,
+                    "next": f"{d['total_p']:,.2f} {target_symbol}"
+                    if d.get("total_p")
+                    else dash,
+                    "income": f"{d['ttm_total']:,.2f} {target_symbol}"
+                    if d.get("ttm_total")
+                    else dash,
+                    "yield": f"{yield_pct:.2f}%" if yield_pct else dash,
+                    "on_cost": Text(f"{on_cost:.2f}%", style="green")
+                    if on_cost
+                    else dash,
+                }
             )
 
         total_income = sum(d.get("ttm_total") or 0 for d in dividend_results)
@@ -1986,22 +2072,23 @@ def build_display_group(
         )
         if total_income:
             div_table.add_section()
-            div_table.add_row(
-                Text("TOTAL", style="bold"),
-                "",
-                "",
-                "",
-                Text(f"{total_income:,.2f} {target_symbol}", style="bold green"),
-                Text(
-                    f"{(total_income / total_val) * 100:.2f}%" if total_val else "",
-                    style="bold",
-                ),
-                Text(
-                    f"{(priced_income / total_cost) * 100:.2f}%"
-                    if total_cost and priced_income
-                    else "",
-                    style="bold green",
-                ),
+            add_div_row(
+                {
+                    "ticker": Text("TOTAL", style="bold"),
+                    "income": Text(
+                        f"{total_income:,.2f} {target_symbol}", style="bold green"
+                    ),
+                    "yield": Text(
+                        f"{(total_income / total_val) * 100:.2f}%" if total_val else "",
+                        style="bold",
+                    ),
+                    "on_cost": Text(
+                        f"{(priced_income / total_cost) * 100:.2f}%"
+                        if total_cost and priced_income
+                        else "",
+                        style="bold green",
+                    ),
+                }
             )
 
     # 3. Trend Panel — recorded portfolio value when we have enough of it,
@@ -2114,6 +2201,13 @@ def build_display_group(
 
     # 5. Footer
     footer = Text(footer_text, style="dim italic") if footer_text else Text("")
+    if dropped_columns:
+        if footer_text:
+            footer.append(" | ", style="dim")
+        footer.append(
+            f"narrow terminal — hidden: {', '.join(dropped_columns)}",
+            style="dim italic",
+        )
 
     elements = [table]
     if div_table:

@@ -1,0 +1,11 @@
+# portfolio with cost basis
+holdings:
+  AAPL:
+    qty: 10
+    cost: 185.20      # bought 2024
+  MC.PA:
+    qty: 45
+    cost: 620.00      # bought near the top
+  IUSA.DE: 720        # no cost recorded — still works
+currency: EUR
+benchmark: ^GSPC
