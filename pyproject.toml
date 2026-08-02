@@ -15,7 +15,14 @@ dependencies = [
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
+mcp = [
+    "mcp>=2.0.0",
+    # Round-trips the holdings YAML so editing it keeps comments and key order.
+    "ruamel.yaml>=0.18.0",
+]
 dev = [
+    # So CI exercises the MCP server and the comment-preserving config writer.
+    "stock-price[mcp]",
     "black>=24.0.0",
     "ruff>=0.3.0",
     "pytest>=8.0.0",
@@ -26,6 +33,7 @@ dev = [
 
 [project.scripts]
 stock-price = "stock:fetch_portfolio"
+stock-price-mcp = "stock_mcp:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -40,7 +48,7 @@ show_missing = true
 fail_under = 60
 
 [tool.setuptools]
-py-modules = ["stock"]
+py-modules = ["stock", "stock_mcp"]
 
 [tool.setuptools.dynamic]
 version = {file = "VERSION"}

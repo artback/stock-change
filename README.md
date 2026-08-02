@@ -7,6 +7,9 @@ A professional terminal-based portfolio tracker that provides real-time stock pr
 ## Features
 
 - 📊 **Real-time Portfolio Summary**: Tracks price, quantity, daily change, and monthly % change with a clean, formatted table.
+- 🎯 **Analyst Consensus**: Shows the analyst rating and upside to the mean price target for each holding, with an arrow when the consensus shifted over the last month.
+- 🤖 **JSON Output**: `--json` emits the whole snapshot as structured data for scripts, dashboards, or an AI assistant.
+- 🔌 **MCP Server**: Let Claude (or any MCP client) read your portfolio and keep your holdings up to date as you buy and sell.
 - 📰 **Related News**: Shows recent business news articles for your portfolio tickers with summaries and clickable links.
 - 💰 **Dividend Calendar**: Displays upcoming ex-dividend dates and estimated payout amounts.
 - 💱 **Multi-Currency Support**: Automatically converts holdings to your target currency (USD, EUR, SEK, etc.) using live exchange rates.
@@ -77,6 +80,101 @@ stock-price --watch --interval 15
 # Also settable via the STOCK_PRICE_CACHE_TTL environment variable.
 stock-price --cache-ttl 60
 ```
+
+### Analyst consensus
+
+Each holding shows an `Analysts` column (the consensus rating and how many
+analysts cover it) and a `Target` column (the upside to their mean price
+target). An arrow marks a consensus that moved over the last month — `↑` for an
+upgrade, `↓` for a downgrade.
+
+The columns only appear when at least one holding has coverage; index funds and
+most small caps have none. This data comes from the rate-limit-prone
+fundamentals endpoint, so it is refreshed at most every 10 minutes, never on the
+fast price-refresh cycle.
+
+```bash
+# Skip analyst data entirely
+stock-price --no-analysts
+```
+
+Note that these are third-party analyst opinions, reported as-is. Consensus
+ratings skew bullish across the market, and a price target is a forecast, not a
+valuation.
+
+### JSON output
+
+```bash
+stock-price --json
+```
+
+Prints the full snapshot — positions, totals, analyst data, dividends, news and
+the 30-day history — as JSON on stdout, with diagnostics on stderr. Useful for
+scripting, and for handing your portfolio to an AI assistant:
+
+```bash
+stock-price --json | jq '.positions[] | {symbol, daily_change_pct, analysts: .analysts.consensus}'
+```
+
+Each position carries a `status` of `ok`, `stale` (last refresh failed, figures
+are the last known good ones) or `error` (never loaded). The payload is versioned
+via `schema_version`, and `--json` honours `--cache-ttl` — a cached snapshot is
+flagged with `"cached": true` and its age. It cannot be combined with `--watch`.
+
+## MCP Server (AI assistants)
+
+An MCP server exposes the portfolio to Claude and other MCP clients, so you can
+ask "how's my portfolio doing?" or say "I bought 5 more Apple" in conversation.
+
+```bash
+pip install "stock-price[mcp]"
+```
+
+Register it with your client — for Claude Code:
+
+```bash
+claude mcp add stock-price -- stock-price-mcp
+```
+
+For Claude Desktop, add this to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "stock-price": {
+      "command": "stock-price-mcp"
+    }
+  }
+}
+```
+
+It reads the same `~/.stock_price.yaml` as the CLI.
+
+### Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `get_portfolio` | Whole portfolio: values, changes, analysts, dividends, news |
+| `get_holding` | One position in detail |
+| `get_analyst_view` | Ratings and price targets for any ticker, held or not |
+| `list_holdings` | Configured tickers and share counts (no prices fetched) |
+| `set_holding` | Set a position to an exact share count |
+| `add_shares` | Add shares after a purchase, or subtract after a sale |
+| `remove_holding` | Drop a ticker entirely |
+
+**The write tools are bookkeeping only.** They edit your local holdings file to
+record what you already own. Nothing in this project places an order, contacts a
+broker, or moves money — and the tool descriptions tell the model so explicitly.
+
+Editing is defensive: an unrecognised ticker is refused rather than silently
+written (a typo would quietly break your portfolio total), the previous file is
+kept as a `.bak`, writes are atomic, and the new contents are parsed before the
+real file is touched. With the `mcp` extra installed, comments and key order in
+your YAML survive an edit.
+
+`set_holding` and `add_shares` mean different things — "I hold 15 in total"
+versus "I bought 5 more" — so it's worth confirming the numbers your assistant
+read back to you.
 
 Tickers that fail to load (network/rate-limit errors or invalid symbols) are
 retried with backoff and, if still unavailable, shown as a stale `⚠` / `error`
