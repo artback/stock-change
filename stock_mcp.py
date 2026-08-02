@@ -49,7 +49,11 @@ def _snapshot(currency: str | None = None, cache_ttl: int = 60) -> dict[str, Any
     config = stock.load_config()
     target = (currency or config["currency"]).upper()
     return stock.collect_portfolio(
-        config["holdings"], target, cache_ttl=cache_ttl
+        config["holdings"],
+        target,
+        cache_ttl=cache_ttl,
+        cost_basis=config.get("cost_basis"),
+        benchmark=config.get("benchmark"),
     )
 
 
@@ -112,18 +116,24 @@ def get_analyst_view(symbol: str) -> dict[str, Any]:
 
 @server.tool(annotations=_READ)
 def list_holdings() -> dict[str, Any]:
-    """List the tickers and share counts currently configured, and where that
-    configuration lives on disk. Reads the file only — no prices are fetched."""
+    """List the tickers, share counts and recorded cost basis currently
+    configured, and where that configuration lives on disk. Reads the file
+    only — no prices are fetched."""
     document, path = stock.read_config_document()
+    quantities, cost_basis = stock.parse_holdings(document["holdings"])
     return {
-        "holdings": {str(k): v for k, v in document["holdings"].items()},
+        "holdings": {str(k): v for k, v in quantities.items()},
+        "cost_basis": {str(k): v for k, v in cost_basis.items()},
         "currency": document.get("currency", "EUR"),
+        "benchmark": document.get("benchmark"),
         "config_path": str(path),
     }
 
 
 @server.tool(annotations=_WRITE)
-def set_holding(symbol: str, quantity: float) -> dict[str, Any]:
+def set_holding(
+    symbol: str, quantity: float, cost: float | None = None
+) -> dict[str, Any]:
     """Record that the user holds exactly this many shares of a ticker, adding
     it to the portfolio if it is new.
 
@@ -137,12 +147,17 @@ def set_holding(symbol: str, quantity: float) -> dict[str, Any]:
         symbol: Ticker, e.g. "AAPL" or "MC.PA" (Yahoo Finance format, so
             non-US listings carry an exchange suffix).
         quantity: Total shares now held. Must be positive; fractional is fine.
+        cost: Average price paid per share, in the ticker's own currency.
+            Recording it is what lets the portfolio report profit and loss.
+            Omit to leave any existing cost basis untouched.
     """
-    return _write_holding(symbol, lambda s: stock.set_holding(s, quantity))
+    return _write_holding(symbol, lambda s: stock.set_holding(s, quantity, cost=cost))
 
 
 @server.tool(annotations=_WRITE)
-def add_shares(symbol: str, quantity: float) -> dict[str, Any]:
+def add_shares(
+    symbol: str, quantity: float, cost: float | None = None
+) -> dict[str, Any]:
     """Add shares to a holding — the user bought more — or subtract with a
     negative quantity after a partial sale. Adds the ticker if it is new.
 
@@ -157,8 +172,11 @@ def add_shares(symbol: str, quantity: float) -> dict[str, Any]:
         symbol: Ticker, e.g. "AAPL".
         quantity: Shares to add; negative to subtract. Reaching exactly zero
             removes the holding.
+        cost: Price paid per share on this purchase, in the ticker's own
+            currency. Recording it is what lets the portfolio report profit
+            and loss. Omit to leave any existing cost basis untouched.
     """
-    return _write_holding(symbol, lambda s: stock.add_shares(s, quantity))
+    return _write_holding(symbol, lambda s: stock.add_shares(s, quantity, cost=cost))
 
 
 @server.tool(annotations=_DELETE)

@@ -153,8 +153,52 @@ def resolve_config_path(config_path=None):
     return Path(env_path) if env_path else DEFAULT_CONFIG_PATH
 
 
+def holding_quantity(entry):
+    """Read the share count out of a holdings entry, in either config form."""
+    if isinstance(entry, dict):
+        return entry.get("qty", entry.get("quantity"))
+    return entry
+
+
+def parse_holdings(raw):
+    """Split a holdings mapping into quantities and per-share cost basis.
+
+    Both config forms are accepted, so existing files keep working::
+
+        AAPL: 10                        # quantity only
+        MC.PA: {qty: 45, cost: 520.50}  # with what you paid
+
+    ``cost`` is per share in the ticker's *own* currency, which is how a
+    contract note reads. Returns are therefore computed in that currency and
+    exclude any FX movement since the purchase — converting a historical cost
+    at today's rate would silently fold currency drift into the return.
+    """
+    quantities = {}
+    cost_basis = {}
+    for symbol, entry in (raw or {}).items():
+        quantity = holding_quantity(entry)
+        if quantity is None:
+            continue
+        quantities[symbol] = quantity
+        if isinstance(entry, dict):
+            cost = entry.get("cost", entry.get("cost_basis"))
+            if cost is not None:
+                try:
+                    cost = float(cost)
+                except (TypeError, ValueError):
+                    continue
+                if cost > 0:
+                    cost_basis[symbol] = cost
+    return quantities, cost_basis
+
+
 def load_config(config_path=None):
-    config_data = {"holdings": DEFAULT_HOLDINGS, "currency": "EUR"}
+    config_data = {
+        "holdings": DEFAULT_HOLDINGS,
+        "currency": "EUR",
+        "cost_basis": {},
+        "benchmark": None,
+    }
 
     resolved_path = resolve_config_path(config_path)
 
@@ -164,9 +208,15 @@ def load_config(config_path=None):
                 user_config = yaml.safe_load(f)
                 if user_config:
                     if "holdings" in user_config:
-                        config_data["holdings"] = user_config["holdings"]
+                        holdings, cost_basis = parse_holdings(user_config["holdings"])
+                        config_data["holdings"] = holdings
+                        config_data["cost_basis"] = cost_basis
                     if "currency" in user_config:
                         config_data["currency"] = user_config["currency"].upper()
+                    if user_config.get("benchmark"):
+                        config_data["benchmark"] = (
+                            str(user_config["benchmark"]).strip().upper()
+                        )
         except Exception as e:
             console.print(f"[red]Error loading config ({resolved_path}):[/red] {e}")
     elif config_path:
@@ -257,6 +307,16 @@ def _normalise_quantity(quantity):
     return int(value) if value.is_integer() else value
 
 
+def _normalise_cost(cost):
+    """Validate an optional per-share purchase price."""
+    if cost is None:
+        return None
+    value = float(cost)
+    if pd.isna(value) or value <= 0:
+        raise ValueError("cost must be a positive number")
+    return value
+
+
 def _normalise_symbol(symbol):
     symbol = str(symbol).strip().upper()
     if not symbol:
@@ -334,13 +394,32 @@ def resolve_symbol(symbol):
     return info
 
 
+def _store_holding(holdings, key, quantity, cost=None):
+    """Write a quantity back without discarding an existing cost basis.
+
+    A holding recorded as ``{qty: 45, cost: 520.50}`` must survive a quantity
+    edit — replacing the mapping with a bare number would silently throw the
+    purchase price away.
+    """
+    existing = holdings.get(key)
+    if isinstance(existing, dict):
+        existing["qty"] = quantity
+        if cost is not None:
+            existing["cost"] = cost
+    elif cost is not None:
+        holdings[key] = {"qty": quantity, "cost": cost}
+    else:
+        holdings[key] = quantity
+
+
 def _apply_holding_change(symbol, config_path, change):
     """Load the config, apply ``change`` to the holdings, and write it back."""
     symbol = _normalise_symbol(symbol)
     document, path = read_config_document(config_path)
     holdings = document["holdings"]
     key = _match_existing_symbol(holdings, symbol) or symbol
-    previous = holdings.get(key)
+    previous_entry = holdings.get(key)
+    previous = holding_quantity(previous_entry)
 
     result = change(holdings, key, previous)
 
@@ -354,24 +433,34 @@ def _apply_holding_change(symbol, config_path, change):
     }
 
 
-def set_holding(symbol, quantity, config_path=None):
-    """Set a holding to an exact quantity, adding the ticker if it is new."""
+def set_holding(symbol, quantity, config_path=None, cost=None):
+    """Set a holding to an exact quantity, adding the ticker if it is new.
+
+    ``cost`` is the per-share purchase price in the ticker's own currency;
+    omitting it leaves any recorded cost basis untouched.
+    """
     quantity = _normalise_quantity(quantity)
     if quantity <= 0:
         raise ValueError("quantity must be positive — use remove_holding to delete")
+    cost = _normalise_cost(cost)
 
     def change(holdings, key, previous):
-        holdings[key] = quantity
-        return {"quantity": quantity, "action": "updated" if previous is not None else "added"}
+        _store_holding(holdings, key, quantity, cost)
+        return {
+            "quantity": quantity,
+            "cost": cost,
+            "action": "updated" if previous is not None else "added",
+        }
 
     return _apply_holding_change(symbol, config_path, change)
 
 
-def add_shares(symbol, quantity, config_path=None):
+def add_shares(symbol, quantity, config_path=None, cost=None):
     """Add to (or, with a negative quantity, subtract from) a holding."""
     delta = _normalise_quantity(quantity)
     if delta == 0:
         raise ValueError("quantity must not be zero")
+    cost = _normalise_cost(cost)
 
     def change(holdings, key, previous):
         total = _normalise_quantity((previous or 0) + delta)
@@ -382,9 +471,10 @@ def add_shares(symbol, quantity, config_path=None):
         if total == 0:
             holdings.pop(key, None)
             return {"quantity": 0, "delta": delta, "action": "removed"}
-        holdings[key] = total
+        _store_holding(holdings, key, total, cost)
         return {
             "quantity": total,
+            "cost": cost,
             "delta": delta,
             "action": "updated" if previous is not None else "added",
         }
@@ -500,7 +590,9 @@ def _cached_previous_close(symbol, ticker, cache):
     return value
 
 
-def get_ticker_summary(symbol, qty, target_currency, rate_cache, prev_close_cache=None):
+def get_ticker_summary(
+    symbol, qty, target_currency, rate_cache, prev_close_cache=None, cost=None
+):
     try:
         def _fetch():
             t = yf.Ticker(symbol)
@@ -532,6 +624,18 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache, prev_close_cach
                 chg_pct = 0
 
             daily_chg_val = val_now - val_prev
+
+            # Return is computed in the ticker's own currency — cost is
+            # recorded there — then the P/L amount is converted for display.
+            # Doing it the other way would fold FX drift into the return.
+            unrealized = None
+            return_pct = None
+            cost_value = None
+            if cost:
+                cost_value = (cost * conv) * qty
+                unrealized = ((price - cost) * conv) * qty
+                return_pct = ((price - cost) / cost) * 100
+
             return {
                 "symbol": symbol,
                 "qty": qty,
@@ -542,35 +646,96 @@ def get_ticker_summary(symbol, qty, target_currency, rate_cache, prev_close_cach
                 "ticker_obj": t,
                 "conv": conv,
                 "source_currency": source_currency,
+                "cost": cost,
+                "cost_value": cost_value,
+                "unrealized": unrealized,
+                "return_pct": return_pct,
+                "price": price,
             }
     except Exception:
         pass
     return None
 
 
+def _trailing_dividend_per_share(ticker, days=365):
+    """Per-share dividends actually paid over the trailing window."""
+    try:
+        history = ticker.dividends
+        if not isinstance(history, pd.Series) or history.empty:
+            return 0.0
+        cutoff = pd.Timestamp.now(tz=history.index.tz) - pd.Timedelta(days=days)
+        return float(history[history.index >= cutoff].sum())
+    except Exception:
+        return 0.0
+
+
 def get_dividend_data(summary_data):
+    """Upcoming dividend and trailing-twelve-month income for one holding.
+
+    Both come off the same ``Ticker``, so they share its fetches. ``ex_date``
+    is ``None`` when nothing is scheduled — a holding can still have paid
+    income over the last year, which is what ``ttm_*`` reports.
+    """
     try:
         t = summary_data["ticker_obj"]
-        cal = t.calendar
-        if cal and "Ex-Dividend Date" in cal:
-            ex_date = cal["Ex-Dividend Date"]
-            if ex_date and not pd.isna(ex_date) and ex_date >= datetime.now().date():
-                d_info = t.info
-                div_amt = (
-                    d_info.get("lastDividendValue") or d_info.get("dividendRate") or 0
-                )
-                if div_amt > 0:
-                    return {
-                        "symbol": summary_data["symbol"],
-                        "ex_date": ex_date,
-                        "amt": div_amt,
-                        "total_p": (div_amt * summary_data["conv"])
-                        * summary_data["qty"],
-                        "cur_label": CURRENCY_SYMBOLS.get(
-                            summary_data["source_currency"],
-                            summary_data["source_currency"],
-                        ),
-                    }
+        qty = summary_data["qty"]
+        conv = summary_data["conv"]
+
+        ex_date = None
+        div_amt = None
+        total_p = None
+        try:
+            cal = t.calendar
+            if cal and "Ex-Dividend Date" in cal:
+                candidate = cal["Ex-Dividend Date"]
+                if (
+                    candidate
+                    and not pd.isna(candidate)
+                    and candidate >= datetime.now().date()
+                ):
+                    d_info = t.info
+                    amount = (
+                        d_info.get("lastDividendValue")
+                        or d_info.get("dividendRate")
+                        or 0
+                    )
+                    if amount > 0:
+                        ex_date = candidate
+                        div_amt = amount
+                        total_p = (amount * conv) * qty
+        except Exception:
+            pass
+
+        ttm_per_share = _trailing_dividend_per_share(t)
+        ttm_total = (ttm_per_share * conv) * qty if ttm_per_share else 0.0
+
+        # Yield on today's price, and — when the purchase price is known —
+        # yield on what was actually paid for the shares.
+        price = summary_data.get("price")
+        yield_pct = (
+            (ttm_per_share / price) * 100
+            if ttm_per_share and price and not pd.isna(price)
+            else None
+        )
+        cost = summary_data.get("cost")
+        yield_on_cost_pct = (ttm_per_share / cost) * 100 if ttm_per_share and cost else None
+
+        if ex_date is None and not ttm_per_share:
+            return None
+
+        return {
+            "symbol": summary_data["symbol"],
+            "ex_date": ex_date,
+            "amt": div_amt,
+            "total_p": total_p,
+            "cur_label": CURRENCY_SYMBOLS.get(
+                summary_data["source_currency"], summary_data["source_currency"]
+            ),
+            "ttm_per_share": ttm_per_share,
+            "ttm_total": ttm_total,
+            "yield_pct": yield_pct,
+            "yield_on_cost_pct": yield_on_cost_pct,
+        }
     except Exception:
         pass
     return None
@@ -745,6 +910,87 @@ def fetch_all_analysts(summary_values):
             if res:
                 results[future_to_symbol[future]] = res
     return results
+
+
+def fetch_benchmark(symbol, period="1mo"):
+    """Index performance over the same window as the portfolio trend.
+
+    Returns ``None`` when the benchmark can't be fetched — it is context for
+    the portfolio's own number, never a reason to fail the refresh.
+    """
+    if not symbol:
+        return None
+    try:
+        history = yf.Ticker(symbol).history(period=period, interval="1d")
+        closes = history["Close"].dropna()
+        if len(closes) < 2:
+            return None
+        start = float(closes.iloc[0])
+        end = float(closes.iloc[-1])
+        if not start:
+            return None
+        return {
+            "symbol": symbol,
+            "change_pct": ((end - start) / start) * 100,
+            "points": [float(v) for v in closes],
+        }
+    except Exception:
+        return None
+
+
+HISTORY_PATH = Path.home() / ".stock_price_history.json"
+HISTORY_RETENTION_DAYS = 400
+
+# Below this many recorded days the trend falls back to pricing today's basket
+# backwards — a two-point "portfolio history" is a straight line, not a trend.
+MIN_RECORDED_HISTORY_POINTS = 5
+
+
+def record_portfolio_value(value, currency, path=HISTORY_PATH, today=None):
+    """Append today's portfolio value to the on-disk history. Best-effort.
+
+    One entry per day, last write of the day winning. Switching target
+    currency resets the series: mixing values denominated differently would
+    make the trend meaningless.
+    """
+    if value is None or pd.isna(value) or value <= 0:
+        return None
+    try:
+        day = str(today or datetime.now().date())
+        data = {}
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception:
+            data = {}
+        points = data.get("points") if data.get("currency") == currency else {}
+        if not isinstance(points, dict):
+            points = {}
+        points[day] = float(value)
+        # Keep the file bounded; sorting is lexicographic, which is also
+        # chronological for ISO dates.
+        for stale in sorted(points)[:-HISTORY_RETENTION_DAYS]:
+            points.pop(stale, None)
+        Path(path).write_text(
+            json.dumps({"currency": currency, "points": points})
+        )
+        return points
+    except Exception:
+        return None
+
+
+def load_portfolio_history(currency, path=HISTORY_PATH, days=30):
+    """Recorded portfolio values for the last ``days``, oldest first."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return []
+    if data.get("currency") != currency:
+        return []
+    points = data.get("points")
+    if not isinstance(points, dict):
+        return []
+    cutoff = str(datetime.now().date() - pd.Timedelta(days=days).to_pytimedelta())
+    return [float(points[d]) for d in sorted(points) if d >= cutoff]
 
 
 def analyst_view(symbol):
@@ -1008,6 +1254,7 @@ def fetch_summaries(
     prev_close_cache=None,
     on_progress=None,
     timeout=15,
+    cost_basis=None,
 ):
     """Fetch per-ticker summaries concurrently.
 
@@ -1019,6 +1266,7 @@ def fetch_summaries(
     """
     summaries = {}
     ticker_to_currency = {}
+    cost_basis = cost_basis or {}
     total = len(holdings)
     if total == 0:
         return summaries, ticker_to_currency, []
@@ -1033,6 +1281,7 @@ def fetch_summaries(
                 target_currency,
                 rate_cache,
                 prev_close_cache,
+                cost_basis.get(s),
             ): s
             for s, q in holdings.items()
         }
@@ -1068,16 +1317,17 @@ def fetch_auxiliary(
     want_dividends=False,
     want_news=False,
     want_analysts=False,
+    benchmark=None,
 ):
     """Refresh whichever of the auxiliary sections are requested, concurrently.
 
     Returns a dict with keys ``history``/``monthly``/``traded`` (when history
-    was requested), ``dividends``, ``news`` and ``analysts`` — present only for
-    the sections that were requested. They only read the summary/holdings, so
+    was requested), ``dividends``, ``news``, ``analysts`` and ``benchmark`` —
+    present only for the sections that were requested. They only read the summary/holdings, so
     running them together avoids serialising independent network round-trips.
     """
     result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         hist_future = (
             pool.submit(fetch_history, holdings, target_currency, ticker_to_currency)
             if want_history
@@ -1098,6 +1348,11 @@ def fetch_auxiliary(
             if want_analysts
             else None
         )
+        # The benchmark rides along with history: they cover the same window
+        # and are only ever shown together.
+        benchmark_future = (
+            pool.submit(fetch_benchmark, benchmark) if want_history and benchmark else None
+        )
 
         if hist_future is not None:
             history, monthly, traded = hist_future.result()
@@ -1110,6 +1365,8 @@ def fetch_auxiliary(
             result["news"] = news_future.result()
         if analyst_future is not None:
             result["analysts"] = analyst_future.result()
+        if benchmark_future is not None:
+            result["benchmark"] = benchmark_future.result()
     return result
 
 
@@ -1124,7 +1381,17 @@ _CACHED_SUMMARY_FIELDS = (
     "daily_chg_val",
     "source_currency",
     "conv",
+    "price",
+    "cost",
+    "cost_value",
+    "unrealized",
+    "return_pct",
 )
+
+
+def _iso_or_none(value):
+    """Stringify an ex-dividend date, keeping "not scheduled" as null."""
+    return None if value is None or pd.isna(value) else str(value)
 
 
 def _cache_key(holdings, currency):
@@ -1155,7 +1422,7 @@ def load_cached_portfolio(holdings, currency, ttl, path=CACHE_PATH):
 
 def save_cached_portfolio(
     holdings, currency, summaries, dividends, news, history_points, monthly_changes,
-    path=CACHE_PATH, analysts=None,
+    path=CACHE_PATH, analysts=None, benchmark=None,
 ):
     """Persist a portfolio snapshot for fast repeated runs. Best-effort."""
     try:
@@ -1166,11 +1433,12 @@ def save_cached_portfolio(
                 {f: s[f] for f in _CACHED_SUMMARY_FIELDS if f in s}
                 for s in summaries
             ],
-            "dividends": [{**d, "ex_date": str(d["ex_date"])} for d in dividends],
+            "dividends": [{**d, "ex_date": _iso_or_none(d.get("ex_date"))} for d in dividends],
             "news": news,
             "history_points": history_points,
             "monthly_changes": monthly_changes,
             "analysts": analysts or {},
+            "benchmark": benchmark,
         }
         Path(path).write_text(json.dumps(payload))
     except Exception:
@@ -1215,6 +1483,7 @@ def portfolio_payload(
     monthly_changes,
     *,
     analysts=None,
+    benchmark=None,
     failed=None,
     holdings=None,
     cached=False,
@@ -1236,6 +1505,8 @@ def portfolio_payload(
     total_val = 0.0
     total_prev = 0.0
     total_daily = 0.0
+    total_cost = 0.0
+    total_unrealized = 0.0
     for s in sorted(summaries, key=lambda x: x["symbol"]):
         symbol = s["symbol"]
         val_now = s.get("val_now")
@@ -1265,9 +1536,17 @@ def portfolio_payload(
                 "month_change_pct": monthly_changes.get(symbol),
                 "source_currency": s.get("source_currency"),
                 "fx_rate": s.get("conv"),
+                "weight_pct": None,  # filled in below, once the total is known
+                "cost_per_share": s.get("cost"),
+                "cost_value": s.get("cost_value"),
+                "unrealized": s.get("unrealized"),
+                "return_pct": s.get("return_pct"),
                 "analysts": analysts.get(symbol),
             }
         )
+        if s.get("cost_value") and not pd.isna(s["cost_value"]):
+            total_cost += s["cost_value"]
+            total_unrealized += s.get("unrealized") or 0
 
     # Holdings that never loaded at all would otherwise be missing entirely,
     # making a partial portfolio look complete to whatever consumes this.
@@ -1285,9 +1564,18 @@ def portfolio_payload(
                 "month_change_pct": None,
                 "source_currency": None,
                 "fx_rate": None,
+                "weight_pct": None,
+                "cost_per_share": None,
+                "cost_value": None,
+                "unrealized": None,
+                "return_pct": None,
                 "analysts": None,
             }
         )
+
+    for position in positions:
+        if position["value"] and total_val:
+            position["weight_pct"] = (position["value"] / total_val) * 100
 
     month_change_pct = None
     if len(history_points) > 1 and history_points[0]:
@@ -1311,11 +1599,20 @@ def portfolio_payload(
                 ((total_val - total_prev) / total_prev) * 100 if total_prev else 0.0
             ),
             "month_change_pct": month_change_pct,
+            "cost_value": total_cost or None,
+            "unrealized": total_unrealized if total_cost else None,
+            "return_pct": (
+                (total_unrealized / total_cost) * 100 if total_cost else None
+            ),
+            "dividend_income_ttm": sum(
+                d.get("ttm_total") or 0 for d in dividends
+            ) or None,
         },
+        "benchmark": benchmark,
         "positions": positions,
         "dividends": [
-            {**d, "ex_date": str(d["ex_date"])}
-            for d in sorted(dividends, key=lambda x: str(x["ex_date"]))
+            {**d, "ex_date": _iso_or_none(d.get("ex_date"))}
+            for d in sorted(dividends, key=lambda x: (x.get("ex_date") is None, str(x.get("ex_date") or "")))
         ],
         "news": list(news or ()),
         "history_points": history_points,
@@ -1330,6 +1627,9 @@ def collect_portfolio(
     cache_ttl=0,
     want_analysts=True,
     cache_path=CACHE_PATH,
+    cost_basis=None,
+    benchmark=None,
+    history_path=HISTORY_PATH,
 ):
     """Fetch a full portfolio snapshot and return it as a JSON-ready payload.
 
@@ -1354,7 +1654,7 @@ def collect_portfolio(
         )
 
     summaries, ticker_to_currency, failed = fetch_summaries(
-        holdings, target_currency, {}, {}
+        holdings, target_currency, {}, {}, cost_basis=cost_basis
     )
     aux = fetch_auxiliary(
         holdings,
@@ -1365,6 +1665,7 @@ def collect_portfolio(
         want_dividends=bool(summaries),
         want_news=bool(summaries),
         want_analysts=bool(summaries) and want_analysts,
+        benchmark=benchmark,
     )
     apply_holiday_zeroing(summaries, aux.get("traded"))
 
@@ -1385,9 +1686,10 @@ def collect_portfolio(
             monthly_changes,
             path=cache_path,
             analysts=analysts,
+            benchmark=aux.get("benchmark"),
         )
 
-    return portfolio_payload(
+    payload = portfolio_payload(
         target_currency,
         list(summaries.values()),
         dividends,
@@ -1395,8 +1697,29 @@ def collect_portfolio(
         history_points,
         monthly_changes,
         analysts=analysts,
+        benchmark=aux.get("benchmark"),
         failed=failed,
         holdings=holdings,
+    )
+    # Record today's value so the trend can eventually come from what the
+    # portfolio was actually worth rather than from pricing today's basket back.
+    if payload["totals"]["value"]:
+        record_portfolio_value(
+            payload["totals"]["value"], target_currency, path=history_path
+        )
+    return payload
+
+
+def _return_cells(summary, target_symbol):
+    """Render the (unrealized P/L, return %) cells for one holding."""
+    unrealized = summary.get("unrealized")
+    return_pct = summary.get("return_pct")
+    if unrealized is None or return_pct is None or pd.isna(return_pct):
+        return Text("-", style="dim"), Text("-", style="dim")
+    style = "green" if return_pct >= 0 else "red"
+    return (
+        Text(f"{unrealized:+,.2f} {target_symbol}", style=style),
+        Text(f"{return_pct:+.2f}%", style=style),
     )
 
 
@@ -1438,14 +1761,17 @@ def build_display_group(
     error_symbols=None,
     holdings=None,
     analyst_results=None,
+    benchmark=None,
+    portfolio_history=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     monthly_changes = monthly_changes or {}
     error_symbols = set(error_symbols or ())
-    # Only widen the table when there is coverage to show — a portfolio of
-    # index funds has none, and two columns of "-" is just noise.
+    # Only widen the table when there is something to show — a portfolio of
+    # index funds has no analyst coverage, and a column of "-" is just noise.
     analyst_results = analyst_results or {}
     show_analysts = bool(analyst_results)
+    show_returns = any(s.get("return_pct") is not None for s in summary_results)
 
     # 1. Summary Table (No expand=True to keep it compact)
     table = Table(
@@ -1463,15 +1789,20 @@ def build_display_group(
     table.add_column(
         f"Daily ({target_symbol})", justify="right", width=12, no_wrap=True
     )
-    table.add_column("Day %", justify="right", width=10, no_wrap=True)
-    table.add_column("Month %", justify="right", width=10, no_wrap=True)
+    table.add_column("Day %", justify="right", width=9, no_wrap=True)
+    table.add_column("Month %", justify="right", width=9, no_wrap=True)
+    if show_returns:
+        table.add_column(f"P/L ({target_symbol})", justify="right", width=14, no_wrap=True)
+        table.add_column("Return %", justify="right", width=9, no_wrap=True)
     if show_analysts:
-        table.add_column("Analysts", justify="right", width=15, no_wrap=True)
-        table.add_column("Target", justify="right", width=9, no_wrap=True)
+        table.add_column("Analysts", justify="right", width=14, no_wrap=True)
+        table.add_column("Target", justify="right", width=8, no_wrap=True)
 
     total_val = 0
     total_prev = 0
     total_daily_chg = 0
+    total_cost = 0
+    total_unrealized = 0
     for s in sorted(summary_results, key=lambda x: x["symbol"]):
         val_now = s["val_now"]
         val_prev = s["val_prev"]
@@ -1486,6 +1817,9 @@ def build_display_group(
             total_prev += val_now if not pd.isna(val_now) else 0
         if not pd.isna(daily_chg):
             total_daily_chg += daily_chg
+        if s.get("cost_value") and not pd.isna(s["cost_value"]):
+            total_cost += s["cost_value"]
+            total_unrealized += s.get("unrealized") or 0
 
         m_chg = monthly_changes.get(s["symbol"])
         m_text = (
@@ -1516,6 +1850,8 @@ def build_display_group(
             else Text("-", style="dim"),
             m_text,
         ]
+        if show_returns:
+            row.extend(_return_cells(s, target_symbol))
         if show_analysts:
             row.extend(_analyst_cells(analyst_results.get(s["symbol"])))
         table.add_row(*row)
@@ -1534,6 +1870,8 @@ def build_display_group(
             Text("-", style="dim"),
             Text("-", style="dim"),
         ]
+        if show_returns:
+            row.extend((Text("-", style="dim"), Text("-", style="dim")))
         if show_analysts:
             row.extend((Text("-", style="dim"), Text("-", style="dim")))
         table.add_row(*row)
@@ -1559,46 +1897,188 @@ def build_display_group(
             ),
             Text(""),
         ]
+        if show_returns:
+            total_return_pct = (
+                (total_unrealized / total_cost) * 100 if total_cost else None
+            )
+            total_row.extend(
+                (
+                    Text(
+                        f"{total_unrealized:+,.2f} {target_symbol}",
+                        style="bold green" if total_unrealized >= 0 else "bold red",
+                    ),
+                    Text(
+                        f"{total_return_pct:+.2f}%"
+                        if total_return_pct is not None
+                        else "",
+                        style="bold green"
+                        if (total_return_pct or 0) >= 0
+                        else "bold red",
+                    ),
+                )
+            )
         if show_analysts:
             total_row.extend((Text(""), Text("")))
         table.add_row(*total_row)
 
-    # 2. Dividends Table
+    # 2. Dividends Table — upcoming payouts, plus what actually arrived over
+    # the trailing year. A holding can have one without the other.
+    upcoming = [d for d in dividend_results if d.get("ex_date")]
+    income = [d for d in dividend_results if d.get("ttm_total")]
     div_table = None
-    if dividend_results:
-        div_table = Table(title="Upcoming Dividends", header_style="bold magenta")
+    if upcoming or income:
+        div_table = Table(title="Dividends", header_style="bold magenta")
         div_table.add_column("Ticker", width=12, no_wrap=True)
         div_table.add_column("Ex-Date", justify="center", width=12, no_wrap=True)
         div_table.add_column("Amount", justify="right", width=12, no_wrap=True)
         div_table.add_column(
-            f"Total ({target_symbol})",
+            f"Next ({target_symbol})",
             justify="right",
             style="green",
-            width=15,
+            width=14,
             no_wrap=True,
         )
-        for d in sorted(dividend_results, key=lambda x: x["ex_date"]):
+        div_table.add_column(
+            f"12M Income ({target_symbol})",
+            justify="right",
+            style="green",
+            width=18,
+            no_wrap=True,
+        )
+        div_table.add_column("Yield", justify="right", width=8, no_wrap=True)
+        div_table.add_column("On Cost", justify="right", width=9, no_wrap=True)
+
+        def _sort_key(entry):
+            # Scheduled payouts first, in date order; income-only rows after.
+            return (entry.get("ex_date") is None, str(entry.get("ex_date") or ""))
+
+        for d in sorted(dividend_results, key=_sort_key):
+            if not d.get("ex_date") and not d.get("ttm_total"):
+                continue
+            yield_pct = d.get("yield_pct")
+            on_cost = d.get("yield_on_cost_pct")
             div_table.add_row(
                 d["symbol"],
-                str(d["ex_date"]),
-                f"{d['amt']:.2f} {d['cur_label']}",
-                f"{d['total_p']:,.2f} {target_symbol}",
+                str(d["ex_date"]) if d.get("ex_date") else Text("-", style="dim"),
+                f"{d['amt']:.2f} {d['cur_label']}"
+                if d.get("amt")
+                else Text("-", style="dim"),
+                f"{d['total_p']:,.2f} {target_symbol}"
+                if d.get("total_p")
+                else Text("-", style="dim"),
+                f"{d['ttm_total']:,.2f} {target_symbol}"
+                if d.get("ttm_total")
+                else Text("-", style="dim"),
+                f"{yield_pct:.2f}%" if yield_pct else Text("-", style="dim"),
+                Text(f"{on_cost:.2f}%", style="green")
+                if on_cost
+                else Text("-", style="dim"),
             )
 
-    # 3. Sparkline Panel
+        total_income = sum(d.get("ttm_total") or 0 for d in dividend_results)
+        # Yield on cost must only count income from positions that actually
+        # have a cost basis — dividing every holding's income by a partial
+        # cost total would inflate it badly.
+        priced_income = sum(
+            d.get("ttm_total") or 0
+            for d in dividend_results
+            if d.get("yield_on_cost_pct") is not None
+        )
+        if total_income:
+            div_table.add_section()
+            div_table.add_row(
+                Text("TOTAL", style="bold"),
+                "",
+                "",
+                "",
+                Text(f"{total_income:,.2f} {target_symbol}", style="bold green"),
+                Text(
+                    f"{(total_income / total_val) * 100:.2f}%" if total_val else "",
+                    style="bold",
+                ),
+                Text(
+                    f"{(priced_income / total_cost) * 100:.2f}%"
+                    if total_cost and priced_income
+                    else "",
+                    style="bold green",
+                ),
+            )
+
+    # 3. Trend Panel — recorded portfolio value when we have enough of it,
+    # otherwise the current basket priced backwards. They answer different
+    # questions, so the label says which one is on screen.
     summary_panel = None
-    if total_val > 0 and history_points and len(history_points) > 1:
-        spark = render_sparkline(history_points)
+    portfolio_history = list(portfolio_history or ())
+    if len(portfolio_history) >= MIN_RECORDED_HISTORY_POINTS:
+        series, series_label = portfolio_history, "30D PORTFOLIO"
+    else:
+        series, series_label = list(history_points or ()), "30D BASKET"
+
+    if total_val > 0 and len(series) > 1:
         summary_text = Text()
-        summary_text.append("30D TREND: ", style="dim")
-        summary_text.append(spark, style="bright_cyan")
-        if len(history_points) >= 2:
-            month_chg = ((history_points[-1] - history_points[0]) / history_points[0]) * 100
+        summary_text.append(f"{series_label}: ", style="dim")
+        summary_text.append(render_sparkline(series), style="bright_cyan")
+        month_chg = ((series[-1] - series[0]) / series[0]) * 100 if series[0] else 0
+        summary_text.append(
+            f"  {month_chg:+.2f}%",
+            style="bold green" if month_chg >= 0 else "bold red",
+        )
+        if series_label == "30D BASKET":
+            summary_text.append("  (today's holdings, priced back)", style="dim italic")
+        if benchmark and benchmark.get("change_pct") is not None:
+            delta = month_chg - benchmark["change_pct"]
+            summary_text.append(f"   vs {benchmark['symbol']} ", style="dim")
             summary_text.append(
-                f"  {month_chg:+.2f}%",
-                style="bold green" if month_chg >= 0 else "bold red",
+                f"{benchmark['change_pct']:+.2f}%",
+                style="green" if benchmark["change_pct"] >= 0 else "red",
+            )
+            summary_text.append(
+                f"  ({delta:+.2f} pts)",
+                style="bold green" if delta >= 0 else "bold red",
             )
         summary_panel = Panel(summary_text, border_style="bright_blue", expand=False)
+
+    # 3b. Allocation Panel — position weights and the currency you are
+    # actually exposed to, which the converted totals otherwise hide.
+    allocation_panel = None
+    if total_val > 0 and len(summary_results) > 1:
+        weights = sorted(
+            (
+                (s["symbol"], s["val_now"] / total_val * 100)
+                for s in summary_results
+                if s.get("val_now") and not pd.isna(s["val_now"])
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        by_currency = {}
+        for s in summary_results:
+            if s.get("val_now") and not pd.isna(s["val_now"]):
+                code = s.get("source_currency") or "?"
+                by_currency[code] = by_currency.get(code, 0) + s["val_now"]
+
+        alloc_text = Text()
+        for i, (symbol, weight) in enumerate(weights):
+            if i:
+                alloc_text.append("\n")
+            alloc_text.append(f"  {symbol:<12}", style="white")
+            alloc_text.append(f"{weight:5.1f}%  ", style="bold")
+            alloc_text.append("█" * max(1, round(weight / 4)), style="bright_blue")
+        if by_currency:
+            alloc_text.append("\n  ")
+            alloc_text.append("By currency: ", style="dim")
+            parts = sorted(by_currency.items(), key=lambda kv: kv[1], reverse=True)
+            for i, (code, value) in enumerate(parts):
+                if i:
+                    alloc_text.append("  ")
+                alloc_text.append(f"{code} {value / total_val * 100:.1f}%", style="cyan")
+        allocation_panel = Panel(
+            alloc_text,
+            title="Allocation",
+            border_style="bright_blue",
+            expand=False,
+            padding=(1, 2),
+        )
 
     # 4. News Panel
     news_panel = None
@@ -1640,6 +2120,8 @@ def build_display_group(
         elements.append(div_table)
     if news_panel:
         elements.append(news_panel)
+    if allocation_panel:
+        elements.append(allocation_panel)
     if summary_panel:
         elements.append(summary_panel)
     elements.append(footer)
@@ -1673,6 +2155,11 @@ def fetch_portfolio():
         help="Print the portfolio as JSON on stdout instead of rendering a table",
     )
     parser.add_argument(
+        "--benchmark",
+        help="Compare the portfolio's 30-day move against this ticker "
+        "(e.g. ^GSPC, ^OMX); overrides the config",
+    )
+    parser.add_argument(
         "--no-analysts",
         action="store_true",
         help="Skip analyst ratings and price targets",
@@ -1685,6 +2172,8 @@ def fetch_portfolio():
     config = load_config(args.config)
     target_currency = (args.currency or config["currency"]).upper()
     holdings = config["holdings"]
+    cost_basis = config.get("cost_basis") or {}
+    benchmark_symbol = args.benchmark or config.get("benchmark")
 
     # Set terminal title (never in --json mode: stdout belongs to the payload)
     if sys.stdout.isatty() and not args.json:
@@ -1704,6 +2193,8 @@ def fetch_portfolio():
                 target_currency,
                 cache_ttl=args.cache_ttl,
                 want_analysts=not args.no_analysts,
+                cost_basis=cost_basis,
+                benchmark=benchmark_symbol,
             )
             print(json.dumps(payload, indent=2, allow_nan=False))
             return
@@ -1723,6 +2214,10 @@ def fetch_portfolio():
                         cached.get("monthly_changes", {}),
                         cached.get("news", []),
                         analyst_results=cached.get("analysts", {}),
+                        # Recorded history lives outside the price cache, so a
+                        # cache hit still gets the real trend.
+                        portfolio_history=load_portfolio_history(target_currency),
+                        benchmark=cached.get("benchmark"),
                     )
                 )
                 return
@@ -1731,6 +2226,8 @@ def fetch_portfolio():
         dividend_cache = {}
         news_cache = []
         analyst_cache = {}
+        benchmark_data = None
+        portfolio_history = load_portfolio_history(target_currency)
         history_points = []
         monthly_changes = {}
         last_history_update = 0
@@ -1782,6 +2279,8 @@ def fetch_portfolio():
                         _news=news_cache,
                         _failed=failed_symbols,
                         _analysts=analyst_cache,
+                        _benchmark=benchmark_data,
+                        _portfolio_history=portfolio_history,
                     ):
                         merged = dict(summary_cache)
                         merged.update(partial)
@@ -1806,6 +2305,7 @@ def fetch_portfolio():
                         rate_cache,
                         prev_close_cache,
                         on_progress=on_progress,
+                        cost_basis=cost_basis,
                     )
                     # Merge fresh data over the cache so a ticker that failed
                     # this cycle keeps its last-good values (flagged stale)
@@ -1846,6 +2346,7 @@ def fetch_portfolio():
                             and not args.no_analysts
                             and (now - last_analyst_update > 600 or not analyst_cache)
                         ),
+                        benchmark=benchmark_symbol,
                     )
                     if "history" in aux:
                         if aux["history"]:
@@ -1861,6 +2362,8 @@ def fetch_portfolio():
                     if "news" in aux:
                         news_cache = aux["news"]
                         last_news_update = now
+                    if aux.get("benchmark"):
+                        benchmark_data = aux["benchmark"]
                     if "analysts" in aux:
                         # Keep the previous values when a refresh comes back
                         # empty (rate limit) rather than blanking the columns.
@@ -1869,6 +2372,15 @@ def fetch_portfolio():
                         last_analyst_update = now
 
                     last_update = datetime.now().strftime("%H:%M:%S")
+
+                    total_value = sum(
+                        v["val_now"]
+                        for v in summary_cache.values()
+                        if v.get("val_now") and not pd.isna(v["val_now"])
+                    )
+                    if total_value:
+                        record_portfolio_value(total_value, target_currency)
+                        portfolio_history = load_portfolio_history(target_currency)
 
                     if summary_cache:
                         save_cached_portfolio(
@@ -1880,6 +2392,7 @@ def fetch_portfolio():
                             history_points,
                             monthly_changes,
                             analysts=analyst_cache,
+                            benchmark=benchmark_data,
                         )
 
                     if not args.watch:
@@ -1916,6 +2429,8 @@ def fetch_portfolio():
                             error_symbols=failed_symbols,
                             holdings=holdings,
                             analyst_results=analyst_cache,
+                            benchmark=benchmark_data,
+                            portfolio_history=portfolio_history,
                         )
                     )
 
@@ -1962,6 +2477,8 @@ def fetch_portfolio():
                     error_symbols=failed_symbols,
                     holdings=holdings,
                     analyst_results=analyst_cache,
+                    benchmark=benchmark_data,
+                    portfolio_history=portfolio_history,
                 )
             )
 
