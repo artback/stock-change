@@ -17,6 +17,7 @@ from stock import (
     EXCHANGE_SCHEDULES,
     JSON_SCHEMA_VERSION,
     KNOWN_CURRENCIES,
+    MIN_RECORDED_HISTORY_POINTS,
     PRESERVES_COMMENTS,
     _consensus_trend,
     _get_exchange_suffix,
@@ -34,6 +35,7 @@ from stock import (
     fetch_all_analysts,
     fetch_all_dividends,
     fetch_auxiliary,
+    fetch_benchmark,
     fetch_history,
     fetch_summaries,
     get_analyst_data,
@@ -41,11 +43,15 @@ from stock import (
     get_news_data,
     get_rate,
     get_ticker_summary,
+    holding_quantity,
     is_any_market_open,
     load_cached_portfolio,
     load_config,
+    load_portfolio_history,
+    parse_holdings,
     portfolio_payload,
     read_config_document,
+    record_portfolio_value,
     remove_holding,
     render_sparkline,
     resolve_config_path,
@@ -763,19 +769,19 @@ class TestBuildDisplayGroup:
         }]
         group = build_display_group([self._summary()], divs, "USD")
         output = _render(group)
-        assert "Upcoming Dividends" in output
+        assert "Dividends" in output
         assert "2099-06-15" in output
 
     def test_with_sparkline(self):
         history = [1400.0, 1420.0, 1450.0, 1500.0]
         group = build_display_group([self._summary()], [], "USD", history_points=history)
         output = _render(group)
-        assert "30D TREND" in output
+        assert "30D BASKET" in output
 
     def test_no_sparkline_without_history(self):
         group = build_display_group([self._summary()], [], "USD")
         output = _render(group)
-        assert "30D TREND" not in output
+        assert "30D BASKET" not in output
 
     def test_with_monthly_changes(self):
         monthly = {"AAPL": 5.25}
@@ -1144,7 +1150,7 @@ class TestFetchAllDividends:
 
 class TestFetchSummaries:
     def test_collects_and_reports_failures(self, mocker):
-        def fake(symbol, qty, currency, rate_cache, prev_close_cache=None):
+        def fake(symbol, qty, currency, rate_cache, prev_close_cache=None, cost=None):
             if symbol == "BAD":
                 return None
             return {"symbol": symbol, "source_currency": "USD", "val_now": qty}
@@ -1602,8 +1608,9 @@ class TestBuildDisplayGroupAnalysts:
                 analyst_results=self._analysts(),
             )
         )
+        table_out = out.split("Allocation")[0]
         rows = {
-            line.split()[1]: line for line in out.splitlines() if "│" in line and (
+            line.split()[1]: line for line in table_out.splitlines() if "│" in line and (
                 "AAPL" in line or "MSFT" in line
             )
         }
@@ -2162,3 +2169,583 @@ class TestAnalystView:
         mocker.patch("stock.yf.Ticker", return_value=MagicMock())
         mocker.patch("stock.get_analyst_data", return_value=None)
         assert analyst_view("AAPL")["analysts"] is None
+
+
+# ---------------------------------------------------------------------------
+# cost basis in the config
+# ---------------------------------------------------------------------------
+
+
+class TestParseHoldings:
+    def test_bare_quantities(self):
+        quantities, cost = parse_holdings({"AAPL": 10, "MC.PA": 45})
+        assert quantities == {"AAPL": 10, "MC.PA": 45}
+        assert cost == {}
+
+    def test_extended_form(self):
+        quantities, cost = parse_holdings({"AAPL": {"qty": 10, "cost": 185.2}})
+        assert quantities == {"AAPL": 10}
+        assert cost == {"AAPL": 185.2}
+
+    def test_mixed_forms_coexist(self):
+        quantities, cost = parse_holdings(
+            {"AAPL": {"qty": 10, "cost": 185.2}, "IUSA.DE": 720}
+        )
+        assert quantities == {"AAPL": 10, "IUSA.DE": 720}
+        assert cost == {"AAPL": 185.2}
+
+    def test_quantity_alias(self):
+        quantities, _ = parse_holdings({"AAPL": {"quantity": 7}})
+        assert quantities == {"AAPL": 7}
+
+    def test_entry_without_quantity_is_skipped(self):
+        quantities, cost = parse_holdings({"AAPL": {"cost": 100.0}})
+        assert quantities == {}
+        assert cost == {}
+
+    @pytest.mark.parametrize("bad", [0, -5, "abc", None])
+    def test_unusable_cost_ignored_but_quantity_kept(self, bad):
+        quantities, cost = parse_holdings({"AAPL": {"qty": 10, "cost": bad}})
+        assert quantities == {"AAPL": 10}
+        assert cost == {}
+
+    def test_empty(self):
+        assert parse_holdings(None) == ({}, {})
+
+
+class TestHoldingQuantity:
+    def test_bare(self):
+        assert holding_quantity(10) == 10
+
+    def test_mapping(self):
+        assert holding_quantity({"qty": 10, "cost": 5}) == 10
+
+    def test_missing(self):
+        assert holding_quantity({"cost": 5}) is None
+
+
+class TestLoadConfigCostBasis:
+    def _write(self, tmp_path, text):
+        path = tmp_path / "c.yaml"
+        path.write_text(text)
+        return path
+
+    def test_cost_basis_and_benchmark_loaded(self, tmp_path):
+        path = self._write(tmp_path, """
+holdings:
+  AAPL: {qty: 10, cost: 185.20}
+  IUSA.DE: 720
+currency: EUR
+benchmark: ^gspc
+""")
+        config = load_config(str(path))
+        assert config["holdings"] == {"AAPL": 10, "IUSA.DE": 720}
+        assert config["cost_basis"] == {"AAPL": 185.2}
+        assert config["benchmark"] == "^GSPC"
+
+    def test_defaults_when_absent(self, tmp_path):
+        path = self._write(tmp_path, "holdings:\n  AAPL: 10\n")
+        config = load_config(str(path))
+        assert config["cost_basis"] == {}
+        assert config["benchmark"] is None
+
+
+# ---------------------------------------------------------------------------
+# returns
+# ---------------------------------------------------------------------------
+
+
+class TestGetTickerSummaryReturns:
+    def _patch(self, mocker, price=200.0, currency="USD"):
+        ticker = MagicMock()
+        mocker.patch(
+            "stock._retry",
+            return_value=(
+                ticker,
+                {"currency": currency, "regularMarketPreviousClose": 190.0},
+                price,
+            ),
+        )
+
+    def test_no_cost_leaves_return_fields_empty(self, mocker):
+        self._patch(mocker)
+        result = get_ticker_summary("AAPL", 10, "USD", {})
+        assert result["cost"] is None
+        assert result["unrealized"] is None
+        assert result["return_pct"] is None
+
+    def test_profit(self, mocker):
+        self._patch(mocker, price=200.0)
+        result = get_ticker_summary("AAPL", 10, "USD", {}, cost=100.0)
+        assert result["cost_value"] == pytest.approx(1000.0)
+        assert result["unrealized"] == pytest.approx(1000.0)
+        assert result["return_pct"] == pytest.approx(100.0)
+
+    def test_loss(self, mocker):
+        self._patch(mocker, price=80.0)
+        result = get_ticker_summary("AAPL", 10, "USD", {}, cost=100.0)
+        assert result["unrealized"] == pytest.approx(-200.0)
+        assert result["return_pct"] == pytest.approx(-20.0)
+
+    def test_return_is_fx_neutral(self, mocker):
+        # Cost is recorded in the ticker's own currency, so the percentage must
+        # not move with the exchange rate — only the converted amount does.
+        self._patch(mocker, price=200.0, currency="USD")
+        result = get_ticker_summary("AAPL", 10, "EUR", {"USDEUR=X": 0.5}, cost=100.0)
+        assert result["return_pct"] == pytest.approx(100.0)
+        assert result["unrealized"] == pytest.approx(500.0)
+
+
+class TestFetchSummariesCostBasis:
+    def test_cost_passed_per_symbol(self, mocker):
+        seen = {}
+
+        def fake(symbol, qty, currency, rate_cache, prev_close_cache=None, cost=None):
+            seen[symbol] = cost
+            return {"symbol": symbol, "source_currency": "USD", "val_now": qty}
+
+        mocker.patch("stock.get_ticker_summary", side_effect=fake)
+        fetch_summaries(
+            {"AAPL": 1, "MSFT": 2}, "USD", {}, cost_basis={"AAPL": 50.0}
+        )
+        assert seen == {"AAPL": 50.0, "MSFT": None}
+
+
+# ---------------------------------------------------------------------------
+# cost basis survives config edits
+# ---------------------------------------------------------------------------
+
+
+COST_CONFIG = """\
+holdings:
+  AAPL:
+    qty: 10
+    cost: 185.20
+  IUSA.DE: 720
+currency: EUR
+"""
+
+
+@pytest.fixture
+def cost_config_file(tmp_path, monkeypatch):
+    path = tmp_path / "cost.yaml"
+    path.write_text(COST_CONFIG)
+    monkeypatch.setenv("STOCK_PRICE_CONFIG", str(path))
+    return path
+
+
+class TestCostBasisSurvivesEdits:
+    def test_quantity_edit_keeps_cost(self, cost_config_file):
+        set_holding("AAPL", 25)
+        config = load_config(str(cost_config_file))
+        assert config["holdings"]["AAPL"] == 25
+        assert config["cost_basis"]["AAPL"] == 185.2
+
+    def test_add_shares_keeps_cost(self, cost_config_file):
+        add_shares("AAPL", 5)
+        config = load_config(str(cost_config_file))
+        assert config["holdings"]["AAPL"] == 15
+        assert config["cost_basis"]["AAPL"] == 185.2
+
+    def test_cost_can_be_updated(self, cost_config_file):
+        set_holding("AAPL", 10, cost=200.0)
+        assert load_config(str(cost_config_file))["cost_basis"]["AAPL"] == 200.0
+
+    def test_cost_can_be_added_to_a_bare_holding(self, cost_config_file):
+        add_shares("IUSA.DE", 10, cost=42.5)
+        config = load_config(str(cost_config_file))
+        assert config["holdings"]["IUSA.DE"] == 730
+        assert config["cost_basis"]["IUSA.DE"] == 42.5
+
+    def test_selling_out_removes_cost_too(self, cost_config_file):
+        add_shares("AAPL", -10)
+        config = load_config(str(cost_config_file))
+        assert "AAPL" not in config["holdings"]
+        assert "AAPL" not in config["cost_basis"]
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_invalid_cost_rejected_and_nothing_written(self, cost_config_file, bad):
+        with pytest.raises(ValueError, match="cost must be a positive number"):
+            set_holding("AAPL", 10, cost=bad)
+        assert cost_config_file.read_text() == COST_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# dividend income
+# ---------------------------------------------------------------------------
+
+
+def _dividend_series(values, days_ago):
+    index = pd.to_datetime(
+        [datetime.now(ZoneInfo("UTC")) - timedelta(days=d) for d in days_ago]
+    )
+    return pd.Series(values, index=index)
+
+
+class TestDividendIncome:
+    def _summary(self, **overrides):
+        summary = {
+            "symbol": "MC.PA",
+            "ticker_obj": MagicMock(),
+            "conv": 1.0,
+            "qty": 10,
+            "source_currency": "EUR",
+            "price": 100.0,
+        }
+        summary.update(overrides)
+        return summary
+
+    def test_trailing_twelve_months_only(self):
+        summary = self._summary()
+        # 2.0 inside the window, 9.0 outside it.
+        summary["ticker_obj"].dividends = _dividend_series([1.0, 1.0, 9.0], [10, 200, 400])
+        summary["ticker_obj"].calendar = None
+        result = get_dividend_data(summary)
+        assert result["ttm_per_share"] == pytest.approx(2.0)
+        assert result["ttm_total"] == pytest.approx(20.0)
+
+    def test_yield_and_yield_on_cost(self):
+        summary = self._summary(cost=50.0)
+        summary["ticker_obj"].dividends = _dividend_series([5.0], [30])
+        summary["ticker_obj"].calendar = None
+        result = get_dividend_data(summary)
+        assert result["yield_pct"] == pytest.approx(5.0)
+        assert result["yield_on_cost_pct"] == pytest.approx(10.0)
+
+    def test_income_reported_without_an_upcoming_payout(self):
+        summary = self._summary()
+        summary["ticker_obj"].dividends = _dividend_series([1.0], [30])
+        summary["ticker_obj"].calendar = None
+        result = get_dividend_data(summary)
+        assert result["ex_date"] is None
+        assert result["ttm_total"] == pytest.approx(10.0)
+
+    def test_upcoming_payout_still_reported(self):
+        summary = self._summary()
+        summary["ticker_obj"].calendar = {"Ex-Dividend Date": date(2099, 6, 15)}
+        summary["ticker_obj"].info = {"lastDividendValue": 2.5}
+        summary["ticker_obj"].dividends = _dividend_series([1.0], [30])
+        result = get_dividend_data(summary)
+        assert result["ex_date"] == date(2099, 6, 15)
+        assert result["total_p"] == pytest.approx(25.0)
+        assert result["ttm_total"] == pytest.approx(10.0)
+
+    def test_no_dividends_at_all(self):
+        summary = self._summary()
+        summary["ticker_obj"].calendar = None
+        summary["ticker_obj"].dividends = pd.Series(dtype=float)
+        assert get_dividend_data(summary) is None
+
+    def test_non_series_dividends_are_tolerated(self):
+        summary = self._summary()
+        summary["ticker_obj"].calendar = None
+        summary["ticker_obj"].dividends = MagicMock()
+        assert get_dividend_data(summary) is None
+
+
+# ---------------------------------------------------------------------------
+# benchmark
+# ---------------------------------------------------------------------------
+
+
+class TestFetchBenchmark:
+    def test_change_computed(self, mocker):
+        frame = pd.DataFrame({"Close": [100.0, 105.0, 110.0]})
+        mocker.patch("stock.yf.Ticker", return_value=MagicMock(history=lambda **k: frame))
+        result = fetch_benchmark("^GSPC")
+        assert result["symbol"] == "^GSPC"
+        assert result["change_pct"] == pytest.approx(10.0)
+        assert result["points"] == [100.0, 105.0, 110.0]
+
+    def test_no_symbol(self):
+        assert fetch_benchmark(None) is None
+        assert fetch_benchmark("") is None
+
+    def test_single_point_is_not_a_trend(self, mocker):
+        frame = pd.DataFrame({"Close": [100.0]})
+        mocker.patch("stock.yf.Ticker", return_value=MagicMock(history=lambda **k: frame))
+        assert fetch_benchmark("^GSPC") is None
+
+    def test_failure_is_not_fatal(self, mocker):
+        mocker.patch("stock.yf.Ticker", side_effect=RuntimeError("boom"))
+        assert fetch_benchmark("^GSPC") is None
+
+    def test_requested_only_alongside_history(self, mocker):
+        bench = mocker.patch("stock.fetch_benchmark", return_value={"symbol": "^GSPC"})
+        mocker.patch("stock.fetch_history", return_value=([1.0], {}, set()))
+        fetch_auxiliary({}, "USD", {}, {}, want_history=True, benchmark="^GSPC")
+        bench.assert_called_once()
+
+        bench.reset_mock()
+        fetch_auxiliary({}, "USD", {}, {}, want_history=False, benchmark="^GSPC")
+        bench.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# recorded portfolio history
+# ---------------------------------------------------------------------------
+
+
+class TestPortfolioHistory:
+    def test_records_one_point_per_day(self, tmp_path):
+        path = tmp_path / "h.json"
+        record_portfolio_value(100.0, "EUR", path=path, today=date(2026, 1, 1))
+        record_portfolio_value(110.0, "EUR", path=path, today=date(2026, 1, 2))
+        data = json.loads(path.read_text())
+        assert data["points"] == {"2026-01-01": 100.0, "2026-01-02": 110.0}
+
+    def test_same_day_overwrites(self, tmp_path):
+        path = tmp_path / "h.json"
+        record_portfolio_value(100.0, "EUR", path=path, today=date(2026, 1, 1))
+        record_portfolio_value(150.0, "EUR", path=path, today=date(2026, 1, 1))
+        assert json.loads(path.read_text())["points"] == {"2026-01-01": 150.0}
+
+    def test_currency_change_resets_the_series(self, tmp_path):
+        # Values in different currencies are not comparable; a mixed series
+        # would render a trend that never happened.
+        path = tmp_path / "h.json"
+        record_portfolio_value(100.0, "EUR", path=path, today=date(2026, 1, 1))
+        record_portfolio_value(120.0, "USD", path=path, today=date(2026, 1, 2))
+        data = json.loads(path.read_text())
+        assert data["currency"] == "USD"
+        assert data["points"] == {"2026-01-02": 120.0}
+
+    @pytest.mark.parametrize("bad", [None, 0, -5, float("nan")])
+    def test_unusable_values_ignored(self, tmp_path, bad):
+        path = tmp_path / "h.json"
+        assert record_portfolio_value(bad, "EUR", path=path) is None
+        assert not path.exists()
+
+    def test_retention_prunes_oldest(self, tmp_path, mocker):
+        mocker.patch("stock.HISTORY_RETENTION_DAYS", 3)
+        path = tmp_path / "h.json"
+        for day in range(1, 6):
+            record_portfolio_value(
+                float(day), "EUR", path=path, today=date(2026, 1, day)
+            )
+        assert sorted(json.loads(path.read_text())["points"]) == [
+            "2026-01-03", "2026-01-04", "2026-01-05",
+        ]
+
+    def test_load_returns_values_oldest_first(self, tmp_path):
+        path = tmp_path / "h.json"
+        today = datetime.now().date()
+        for i, value in enumerate([10.0, 20.0, 30.0]):
+            record_portfolio_value(
+                value, "EUR", path=path, today=today - timedelta(days=2 - i)
+            )
+        assert load_portfolio_history("EUR", path=path) == [10.0, 20.0, 30.0]
+
+    def test_load_ignores_a_different_currency(self, tmp_path):
+        path = tmp_path / "h.json"
+        record_portfolio_value(10.0, "EUR", path=path)
+        assert load_portfolio_history("USD", path=path) == []
+
+    def test_load_drops_points_outside_the_window(self, tmp_path):
+        path = tmp_path / "h.json"
+        today = datetime.now().date()
+        record_portfolio_value(1.0, "EUR", path=path, today=today - timedelta(days=90))
+        record_portfolio_value(2.0, "EUR", path=path, today=today)
+        assert load_portfolio_history("EUR", path=path, days=30) == [2.0]
+
+    def test_missing_file(self, tmp_path):
+        assert load_portfolio_history("EUR", path=tmp_path / "nope.json") == []
+
+
+# ---------------------------------------------------------------------------
+# the new panels and columns
+# ---------------------------------------------------------------------------
+
+
+class TestReturnColumns:
+    def _summary(self, symbol="AAPL", cost=100.0, price=150.0, qty=10):
+        return {
+            "symbol": symbol,
+            "qty": qty,
+            "val_now": price * qty,
+            "val_prev": price * qty,
+            "chg_pct": 0.0,
+            "daily_chg_val": 0.0,
+            "source_currency": "USD",
+            "conv": 1.0,
+            "price": price,
+            "cost": cost,
+            "cost_value": (cost * qty) if cost else None,
+            "unrealized": ((price - cost) * qty) if cost else None,
+            "return_pct": (((price - cost) / cost) * 100) if cost else None,
+        }
+
+    def test_hidden_without_any_cost_basis(self):
+        out = _render(build_display_group([self._summary(cost=None)], [], "USD"))
+        assert "Return %" not in out
+
+    def test_shown_when_cost_is_known(self):
+        out = _render(build_display_group([self._summary()], [], "USD"))
+        assert "Return %" in out
+        assert "+50.00%" in out
+        assert "+500.00" in out
+
+    def test_loss_rendered(self):
+        out = _render(build_display_group([self._summary(price=50.0)], [], "USD"))
+        assert "-50.00%" in out
+
+    def test_position_without_cost_shows_dash(self):
+        out = _render(
+            build_display_group(
+                [self._summary("AAPL"), self._summary("MSFT", cost=None)], [], "USD"
+            )
+        )
+        table_out = out.split("Allocation")[0]
+        msft = next(ln for ln in table_out.splitlines() if "MSFT" in ln)
+        assert "%" not in msft.split("MSFT")[1].replace("+0.00%", "")
+
+    def test_total_return_uses_only_priced_positions(self):
+        # MSFT has no cost, so it must not dilute the total return figure.
+        out = _render(
+            build_display_group(
+                [self._summary("AAPL"), self._summary("MSFT", cost=None)], [], "USD"
+            )
+        )
+        assert "+50.00%" in out
+
+
+class TestAllocationPanel:
+    def _summary(self, symbol, value, currency="USD"):
+        return {
+            "symbol": symbol, "qty": 1, "val_now": value, "val_prev": value,
+            "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": currency,
+            "conv": 1.0,
+        }
+
+    def test_weights_and_currency_exposure(self):
+        out = _render(
+            build_display_group(
+                [self._summary("AAPL", 750.0, "USD"),
+                 self._summary("MC.PA", 250.0, "EUR")],
+                [], "USD",
+            )
+        )
+        assert "Allocation" in out
+        assert "75.0%" in out
+        assert "25.0%" in out
+        assert "By currency" in out
+        assert "USD 75.0%" in out
+
+    def test_hidden_for_a_single_holding(self):
+        out = _render(build_display_group([self._summary("AAPL", 100.0)], [], "USD"))
+        assert "Allocation" not in out
+
+
+class TestTrendPanel:
+    def _summary(self):
+        return {
+            "symbol": "AAPL", "qty": 1, "val_now": 100.0, "val_prev": 100.0,
+            "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "USD",
+        }
+
+    def test_basket_label_without_recorded_history(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD", history_points=[90.0, 100.0]
+            )
+        )
+        assert "30D BASKET" in out
+        assert "today's holdings, priced back" in out
+
+    def test_portfolio_label_once_enough_days_recorded(self):
+        recorded = [float(90 + i) for i in range(MIN_RECORDED_HISTORY_POINTS)]
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD",
+                history_points=[10.0, 20.0], portfolio_history=recorded,
+            )
+        )
+        assert "30D PORTFOLIO" in out
+        assert "30D BASKET" not in out
+
+    def test_too_few_recorded_points_falls_back(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD",
+                history_points=[90.0, 100.0], portfolio_history=[99.0, 100.0],
+            )
+        )
+        assert "30D BASKET" in out
+
+    def test_benchmark_comparison(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD",
+                history_points=[100.0, 110.0],
+                benchmark={"symbol": "^GSPC", "change_pct": 4.0},
+            )
+        )
+        assert "^GSPC" in out
+        assert "+4.00%" in out
+        assert "+6.00 pts" in out
+
+    def test_no_benchmark_no_comparison(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "USD", history_points=[100.0, 110.0]
+            )
+        )
+        assert "pts" not in out
+
+
+class TestDividendIncomeTable:
+    def _div(self, symbol="AAPL", ex_date=None, ttm_total=0.0, on_cost=None):
+        return {
+            "symbol": symbol, "ex_date": ex_date, "amt": 1.0 if ex_date else None,
+            "total_p": 10.0 if ex_date else None, "cur_label": "$",
+            "ttm_per_share": 1.0 if ttm_total else 0.0, "ttm_total": ttm_total,
+            "yield_pct": 2.0 if ttm_total else None, "yield_on_cost_pct": on_cost,
+        }
+
+    def _summary(self, value=1000.0, cost_value=None):
+        return {
+            "symbol": "AAPL", "qty": 10, "val_now": value, "val_prev": value,
+            "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "USD",
+            "cost_value": cost_value,
+            "unrealized": 0.0 if cost_value else None,
+            "return_pct": 0.0 if cost_value else None,
+        }
+
+    def test_income_shown_without_an_upcoming_payout(self):
+        out = _render(
+            build_display_group([self._summary()], [self._div(ttm_total=40.0)], "USD")
+        )
+        assert "12M Income" in out
+        assert "40.00" in out
+
+    def test_totals_row(self):
+        out = _render(
+            build_display_group(
+                [self._summary()],
+                [self._div("AAPL", ttm_total=40.0), self._div("MSFT", ttm_total=60.0)],
+                "USD",
+            )
+        )
+        assert "100.00" in out
+
+    def test_yield_on_cost_total_excludes_unpriced_income(self):
+        # AAPL has a cost basis, MSFT does not. Dividing both incomes by only
+        # AAPL's cost would report 20% instead of 10%.
+        out = _render(
+            build_display_group(
+                [self._summary(cost_value=1000.0)],
+                [
+                    self._div("AAPL", ttm_total=100.0, on_cost=10.0),
+                    self._div("MSFT", ttm_total=100.0),
+                ],
+                "USD",
+            )
+        )
+        # The summary table has a TOTAL row too; this one is the dividends table's.
+        dividends_out = out.split("12M Income")[1]
+        total_row = next(ln for ln in dividends_out.splitlines() if "TOTAL" in ln)
+        cells = [c.strip() for c in total_row.split("│") if c.strip()]
+        # Yield is 200/1000 across every holding; on-cost is 100/1000 using
+        # only the position that actually has a cost basis.
+        assert cells[-2] == "20.00%"
+        assert cells[-1] == "10.00%"

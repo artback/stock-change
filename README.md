@@ -7,11 +7,14 @@ A professional terminal-based portfolio tracker that provides real-time stock pr
 ## Features
 
 - 📊 **Real-time Portfolio Summary**: Tracks price, quantity, daily change, and monthly % change with a clean, formatted table.
+- 💹 **Cost Basis & Returns**: Record what you paid and see unrealized profit/loss and return % per position and overall.
+- 📈 **Portfolio History & Benchmark**: Tracks what your portfolio was actually worth day by day, and compares it against an index.
+- 🥧 **Allocation**: Position weights and the currency you are really exposed to.
 - 🎯 **Analyst Consensus**: Shows the analyst rating and upside to the mean price target for each holding, with an arrow when the consensus shifted over the last month.
 - 🤖 **JSON Output**: `--json` emits the whole snapshot as structured data for scripts, dashboards, or an AI assistant.
 - 🔌 **MCP Server**: Let Claude (or any MCP client) read your portfolio and keep your holdings up to date as you buy and sell.
 - 📰 **Related News**: Shows recent business news articles for your portfolio tickers with summaries and clickable links.
-- 💰 **Dividend Calendar**: Displays upcoming ex-dividend dates and estimated payout amounts.
+- 💰 **Dividends**: Upcoming ex-dividend dates plus the income actually received over the last 12 months, with yield and yield-on-cost.
 - 💱 **Multi-Currency Support**: Automatically converts holdings to your target currency (USD, EUR, SEK, etc.) using live exchange rates.
 - ⌚ **Watch Mode**: Update your portfolio in real-time with the `--watch` flag.
 - ⚙️ **External Configuration**: Managed via a simple YAML file in your home directory.
@@ -53,7 +56,28 @@ holdings:
   AAPL: 10          # US Stock
   MC.PA: 45         # French Stock
 currency: EUR       # Target currency for total value and conversion
+benchmark: ^GSPC    # Optional: compare your 30-day move against an index
 ```
+
+### Recording what you paid
+
+Give a holding a `cost` and the tool can report profit and loss, not just
+current value. Both forms work, and you can mix them freely:
+
+```yaml
+holdings:
+  AAPL:
+    qty: 10
+    cost: 185.20    # average price paid per share
+  IUSA.DE: 720      # no cost recorded — still tracked, just no P/L
+currency: EUR
+```
+
+`cost` is per share in the **ticker's own currency**, the way a contract note
+reads. Returns are therefore computed in that currency and exclude any FX
+movement since you bought: converting a historical cost at today's rate would
+quietly fold currency drift into what looks like a stock return. The P/L
+*amount* is converted to your target currency for display.
 
 ## Usage
 
@@ -80,6 +104,26 @@ stock-price --watch --interval 15
 # Also settable via the STOCK_PRICE_CACHE_TTL environment variable.
 stock-price --cache-ttl 60
 ```
+
+### Performance and allocation
+
+With a cost basis recorded, the summary table gains `P/L` and `Return %`
+columns, and the dividends table gains 12-month income, yield and
+yield-on-cost. An allocation panel shows position weights and currency
+exposure — the converted totals otherwise hide which currencies you are
+actually holding.
+
+The trend panel is labelled according to what it can honestly show:
+
+- **`30D PORTFOLIO`** — what your portfolio was actually worth, from values
+  recorded each time you run the tool (kept in `~/.stock_price_history.json`).
+- **`30D BASKET`** — the fallback until enough days have been recorded: today's
+  holdings priced backwards over 30 days. Useful, but it is the market
+  performance of your *current* basket, not your portfolio's history. If you
+  bought a position yesterday, this line pretends you held it all month.
+
+Set a `benchmark` (in the config, or `--benchmark ^OMX`) to see the index's
+move over the same window and the gap in percentage points.
 
 ### Analyst consensus
 
@@ -158,7 +202,7 @@ It reads the same `~/.stock_price.yaml` as the CLI.
 | `get_holding` | One position in detail |
 | `get_analyst_view` | Ratings and price targets for any ticker, held or not |
 | `list_holdings` | Configured tickers and share counts (no prices fetched) |
-| `set_holding` | Set a position to an exact share count |
+| `set_holding` | Set a position to an exact share count, optionally with cost |
 | `add_shares` | Add shares after a purchase, or subtract after a sale |
 | `remove_holding` | Drop a ticker entirely |
 
@@ -171,6 +215,9 @@ written (a typo would quietly break your portfolio total), the previous file is
 kept as a `.bak`, writes are atomic, and the new contents are parsed before the
 real file is touched. With the `mcp` extra installed, comments and key order in
 your YAML survive an edit.
+
+Both write tools take an optional `cost`, so "I bought 5 more Apple at 310"
+records the purchase price as well as the share count.
 
 `set_holding` and `add_shares` mean different things — "I hold 15 in total"
 versus "I bought 5 more" — so it's worth confirming the numbers your assistant
