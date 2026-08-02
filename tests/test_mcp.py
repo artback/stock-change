@@ -15,7 +15,6 @@ from mcp import Client  # noqa: E402
 import stock  # noqa: E402
 import stock_mcp  # noqa: E402
 
-
 CONFIG = """\
 # My portfolio
 holdings:

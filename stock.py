@@ -1,28 +1,29 @@
-import os
-import yfinance as yf
-import logging
-import yaml
-import time
-import json
 import argparse
 import concurrent.futures
+import contextlib
 import io
+import json
+import logging
+import os
 import shutil
 import sys
-from pathlib import Path
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.text import Text
-from rich.live import Live
-from rich.console import Group
+import time
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
 import pandas as pd
+import yaml
+import yfinance as yf
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 try:
-    import termios
     import select as select_mod
+    import termios
 except ImportError:
     termios = None
     select_mod = None
@@ -159,7 +160,7 @@ def load_config(config_path=None):
 
     if resolved_path.exists():
         try:
-            with open(resolved_path, "r") as f:
+            with open(resolved_path) as f:
                 user_config = yaml.safe_load(f)
                 if user_config:
                     if "holdings" in user_config:
@@ -807,7 +808,9 @@ def get_news_data(symbols, max_age_days=14):
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(symbols)) as executor:
         raw_news = list(executor.map(_fetch_raw_news, symbols))
 
-    for symbol, articles in zip(symbols, raw_news):
+    # strict=True: executor.map yields exactly one result per symbol, so an
+    # uneven zip would mean news was being attributed to the wrong ticker.
+    for symbol, articles in zip(symbols, raw_news, strict=True):
         try:
             for article in articles[:3]:
                 content = article.get("content", {})
@@ -817,12 +820,12 @@ def get_news_data(symbols, max_age_days=14):
                 pub_date_raw = content.get("pubDate", "")
                 pub_dt = None
                 if pub_date_raw:
-                    try:
+                    # An unparseable date just means we can't age-filter this
+                    # article; keep it rather than dropping it.
+                    with contextlib.suppress(Exception):
                         pub_dt = datetime.fromisoformat(
                             pub_date_raw.replace("Z", "+00:00")
                         )
-                    except Exception:
-                        pass
                 if pub_dt and pub_dt < cutoff:
                     continue
                 seen_titles.add(title)
@@ -1764,21 +1767,36 @@ def fetch_portfolio():
 
             try:
                 while True:
-                    def on_progress(completed, total, partial):
+                    # The auxiliary caches are rebound further down each cycle.
+                    # This callback fires during fetch_summaries just below —
+                    # before that happens — so it should show the previous
+                    # cycle's values while prices refresh. Binding them as
+                    # defaults captures exactly that, and keeps it true even if
+                    # the callback ever stops being invoked synchronously.
+                    def on_progress(
+                        completed,
+                        total,
+                        partial,
+                        _dividends=dividend_cache,
+                        _history=history_points,
+                        _news=news_cache,
+                        _failed=failed_symbols,
+                        _analysts=analyst_cache,
+                    ):
                         merged = dict(summary_cache)
                         merged.update(partial)
                         live.update(
                             build_display_group(
                                 list(merged.values()),
-                                list(dividend_cache.values()),
+                                list(_dividends.values()),
                                 target_currency,
                                 f"Updating ({completed}/{total})...",
-                                history_points,
+                                _history,
                                 monthly_changes,
-                                news_cache,
-                                error_symbols=failed_symbols,
+                                _news,
+                                error_symbols=_failed,
                                 holdings=holdings,
-                                analyst_results=analyst_cache,
+                                analyst_results=_analysts,
                             )
                         )
 
@@ -1906,12 +1924,16 @@ def fetch_portfolio():
                     ticks = effective_interval * 10
                     for _ in range(ticks):
                         time.sleep(0.1)
-                        if args.watch and sys.stdin.isatty() and select_mod:
-                            if select_mod.select([sys.stdin], [], [], 0)[0]:
-                                while select_mod.select([sys.stdin], [], [], 0)[0]:
-                                    sys.stdin.read(1)
-                                triggered = True
-                                break
+                        if (
+                            args.watch
+                            and sys.stdin.isatty()
+                            and select_mod
+                            and select_mod.select([sys.stdin], [], [], 0)[0]
+                        ):
+                            while select_mod.select([sys.stdin], [], [], 0)[0]:
+                                sys.stdin.read(1)
+                            triggered = True
+                            break
                         if time.time() - start_wait > effective_interval + 5:
                             triggered = True
                             break

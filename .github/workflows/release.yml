@@ -11,7 +11,15 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing reaches the tag, the GitHub release or the Homebrew tap until the
+  # full test matrix is green. Without this the two workflows run in parallel
+  # and a red build still ships to users — which is what happened for v0.6.0.
+  test:
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
+
   create-release:
+    needs: test
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_version.outputs.VERSION }}

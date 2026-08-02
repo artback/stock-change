@@ -19,10 +19,10 @@ from stock import (
     KNOWN_CURRENCIES,
     PRESERVES_COMMENTS,
     _consensus_trend,
-    _price_service_reachable,
     _get_exchange_suffix,
     _has_market_activity,
     _json_safe,
+    _price_service_reachable,
     _retry,
     _score_ratings,
     add_shares,
@@ -55,7 +55,6 @@ from stock import (
     validate_currency,
     write_config_document,
 )
-
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -546,7 +545,7 @@ class TestFetchHistory:
 
         holdings = {"AAPL": 10}
         ticker_to_currency = {"AAPL": "USD"}
-        totals, changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
+        totals, changes, _traded = fetch_history(holdings, "USD", ticker_to_currency)
 
         assert len(totals) == 3
         assert totals[0] == pytest.approx(1000.0)
@@ -556,13 +555,13 @@ class TestFetchHistory:
 
     def test_empty_download(self, mocker):
         mocker.patch("yfinance.download", return_value=pd.DataFrame())
-        totals, changes, traded = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
+        totals, changes, _traded = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
         assert totals == []
         assert changes == {}
 
     def test_exception_returns_empty(self, mocker):
         mocker.patch("yfinance.download", side_effect=Exception("network"))
-        totals, changes, traded = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
+        totals, changes, _traded = fetch_history({"AAPL": 10}, "USD", {"AAPL": "USD"})
         assert totals == []
         assert changes == {}
 
@@ -578,7 +577,7 @@ class TestFetchHistory:
 
         holdings = {"TEST.ST": 10}
         ticker_to_currency = {"TEST.ST": "SEK"}
-        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        totals, _changes, _traded = fetch_history(holdings, "EUR", ticker_to_currency)
         assert len(totals) == 3
         assert totals[0] == pytest.approx(100.0 * 10 * 0.09)
         assert totals[-1] == pytest.approx(120.0 * 10 * 0.10)
@@ -591,7 +590,7 @@ class TestFetchHistory:
 
         holdings = {"AAPL": 5}
         ticker_to_currency = {"AAPL": "USD"}
-        totals, changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
+        totals, _changes, _traded = fetch_history(holdings, "USD", ticker_to_currency)
         assert len(totals) == 2
 
     def test_holiday_row_with_only_forex_excluded(self, mocker):
@@ -611,7 +610,7 @@ class TestFetchHistory:
 
         holdings = {"TEST.ST": 10}
         ticker_to_currency = {"TEST.ST": "SEK"}
-        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        totals, _changes, _traded = fetch_history(holdings, "EUR", ticker_to_currency)
         # Holiday row should be excluded — only 3 trading days
         assert len(totals) == 3
         # Last total uses day 3 stock price (110) with day 3 rate (0.09)
@@ -632,7 +631,7 @@ class TestFetchHistory:
 
         holdings = {"AAPL": 10}
         ticker_to_currency = {"AAPL": "USD"}
-        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        _totals, _changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
         assert traded == set()
 
     def test_traded_today_contains_tickers_with_data(self, mocker):
@@ -649,7 +648,7 @@ class TestFetchHistory:
 
         holdings = {"AAPL": 10}
         ticker_to_currency = {"AAPL": "USD"}
-        totals, changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
+        _totals, _changes, traded = fetch_history(holdings, "USD", ticker_to_currency)
         assert traded == {"AAPL"}
 
     def test_partial_holiday_mixed_exchanges(self, mocker):
@@ -670,7 +669,7 @@ class TestFetchHistory:
 
         holdings = {"7203.T": 100, "SVOL-B.ST": 500}
         ticker_to_currency = {"7203.T": "JPY", "SVOL-B.ST": "SEK"}
-        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        _totals, _changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
         assert "7203.T" in traded
         assert "SVOL-B.ST" not in traded
 
@@ -692,7 +691,7 @@ class TestFetchHistory:
 
         holdings = {"LIFCO-B.ST": 5, "INVE-B.ST": 10}
         ticker_to_currency = {"LIFCO-B.ST": "SEK", "INVE-B.ST": "SEK"}
-        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        _totals, _changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
         assert traded == {"LIFCO-B.ST", "INVE-B.ST"}
 
     def test_bfill_fixes_missing_rate_on_first_day(self, mocker):
@@ -709,7 +708,7 @@ class TestFetchHistory:
 
         holdings = {"TEST.ST": 10}
         ticker_to_currency = {"TEST.ST": "SEK"}
-        totals, changes, traded = fetch_history(holdings, "EUR", ticker_to_currency)
+        totals, _changes, _traded = fetch_history(holdings, "EUR", ticker_to_currency)
         assert len(totals) == 3
         # First day should use backfilled rate 0.09, not 1.0
         assert totals[0] == pytest.approx(100.0 * 10 * 0.09)
@@ -1060,7 +1059,7 @@ class TestIsAnyMarketOpen:
             assert suffix in EXCHANGE_SCHEDULES
 
     def test_default_schedule_is_nyse(self):
-        # NYSE/Nasdaq regular session is 09:30–16:00 Eastern.
+        # NYSE/Nasdaq regular session is 09:30-16:00 Eastern.
         assert DEFAULT_SCHEDULE == ("America/New_York", 9.5, 16)
 
 
@@ -1178,7 +1177,7 @@ class TestFetchSummaries:
 
     def test_future_exception_counts_as_failed(self, mocker):
         mocker.patch("stock.get_ticker_summary", side_effect=Exception("boom"))
-        summaries, ttc, failed = fetch_summaries({"AAPL": 1}, "USD", {})
+        summaries, _ttc, failed = fetch_summaries({"AAPL": 1}, "USD", {})
         assert summaries == {}
         assert failed == ["AAPL"]
 

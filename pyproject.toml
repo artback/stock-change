@@ -36,12 +36,27 @@ stock-price = "stock:fetch_portfolio"
 stock-price-mcp = "stock_mcp:main"
 
 [tool.ruff.lint]
-# Ruff's classic default rule set, stated explicitly. With `ruff` unpinned in
-# the dev extra, relying on the *implicit* defaults means any release that
-# widens them turns CI red on untouched code — which is what 0.16 did, on 53
-# findings that predate it. Widening the set is a deliberate cleanup, not
-# something a dependency resolution should spring on us.
-select = ["E4", "E7", "E9", "F"]
+# Stated explicitly rather than inherited. With `ruff` unpinned in the dev
+# extra, relying on the *implicit* defaults means any release that widens them
+# turns CI red on untouched code — which is exactly what 0.16 did.
+select = [
+    "E4", "E7", "E9",  # pycodestyle errors
+    "F",               # pyflakes
+    "B",               # bugbear
+    "I",               # import sorting
+    "SIM",             # simplify
+    "UP",              # pyupgrade
+    "RUF",             # ruff-specific
+]
+ignore = [
+    # This module deliberately swallows exceptions nearly everywhere: one bad
+    # ticker, a rate limit or a malformed feed must degrade a single row, not
+    # take down the portfolio. BLE001/S110 would fire ~28 times on that design
+    # and the noqa noise would drown the file. Reconsider only alongside a real
+    # change to the error-handling strategy.
+    "BLE001",
+    "S110",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
