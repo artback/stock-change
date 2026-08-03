@@ -96,7 +96,7 @@ job "stock-bot" {
           # Pinned to a tag: an unpinned main could restart into a broken bot
           # unattended.
           pip install --no-cache-dir --quiet \
-            "git+https://github.com/artback/stock-change.git@v0.7.3"
+            "git+https://github.com/artback/stock-change.git@v0.8.0"
           exec stock-price-bot
         EOT
       }
