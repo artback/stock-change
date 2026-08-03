@@ -7,6 +7,10 @@
 #     telegram_token=<token from @BotFather> \
 #     allowed_chat_ids=<your numeric chat id>
 #
+# Don't know your chat id? Set allowed_chat_ids="" for the first run, message
+# the bot, and it replies with the id. It serves no portfolio data until the
+# allowlist is filled in.
+#
 #   nomad job run deploy/nomad/stock-bot.nomad.hcl
 #
 # The bot is read-only: it reports the portfolio and cannot edit holdings or
@@ -96,7 +100,7 @@ job "stock-bot" {
           # Pinned to a tag: an unpinned main could restart into a broken bot
           # unattended.
           pip install --no-cache-dir --quiet \
-            "git+https://github.com/artback/stock-change.git@v0.8.0"
+            "git+https://github.com/artback/stock-change.git@v0.8.1"
           exec stock-price-bot
         EOT
       }

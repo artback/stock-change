@@ -247,9 +247,14 @@ stock-price-bot
 | `/dividends`, `/d` | Upcoming payouts and 12-month income |
 | `/news`, `/n` | Recent headlines |
 
-`TELEGRAM_ALLOWED_CHAT_IDS` is required and the bot refuses to start without
-it. A Telegram bot answers anyone who finds it, so without an allowlist your
-portfolio is readable by a stranger who guesses the name.
+### Finding your chat ID
+
+Start the bot without `TELEGRAM_ALLOWED_CHAT_IDS` and message it. It replies
+with your chat ID and serves nothing else — no portfolio data is exposed while
+it is unconfigured. Put that ID in the allowlist and restart.
+
+A Telegram bot answers anyone who finds it, so once configured the allowlist is
+the only thing keeping your portfolio private: unknown chats get silence.
 
 A ready-to-run Nomad job for a home cluster is in
 [`deploy/nomad/stock-bot.nomad.hcl`](deploy/nomad/stock-bot.nomad.hcl). It keeps

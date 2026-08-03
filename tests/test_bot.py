@@ -108,13 +108,6 @@ class TestAccessControl:
         stock_bot.process_update(self._update(999), "tok", {"42"})
         assert not any("MC.PA" in str(params) for _, params in sent)
 
-    def test_empty_allowlist_refuses_to_start(self, monkeypatch):
-        # An open bot exposes the portfolio to anyone who finds it.
-        monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
-        monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
-        with pytest.raises(SystemExit, match="ALLOWED_CHAT_IDS"):
-            stock_bot.main()
-
     def test_missing_token_refuses_to_start(self, monkeypatch):
         monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
         monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
@@ -246,3 +239,53 @@ class TestFormatting:
     def test_messages_are_sent_as_html(self, sent):
         stock_bot.send_message("tok", 42, "hi")
         assert sent[0][1]["parse_mode"] == "HTML"
+
+
+class TestSetupMode:
+    """With no allowlist the bot must still be configurable.
+
+    The allowlist can't be filled in until you know your own chat ID, and the
+    bot is the obvious place to ask — but it must not become an open door to
+    the portfolio in the meantime.
+    """
+
+    def _update(self, chat_id=4242, text="/start"):
+        return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
+
+    def test_reports_the_sender_chat_id(self, sent, portfolio):
+        assert stock_bot.process_update(self._update(), "tok", set()) is True
+        assert "4242" in sent[0][1]["text"]
+
+    def test_says_it_is_unconfigured(self, sent, portfolio):
+        stock_bot.process_update(self._update(), "tok", set())
+        assert "Not configured" in sent[0][1]["text"]
+
+    def test_serves_no_portfolio_data(self, sent, portfolio):
+        stock_bot.process_update(self._update(text="/portfolio"), "tok", set())
+        body = sent[0][1]["text"]
+        assert "MC.PA" not in body
+        assert "21,381.75" not in body
+
+    def test_every_command_gets_the_same_setup_reply(self, sent, portfolio):
+        for command in ("/start", "/portfolio", "/dividends", "/news"):
+            sent.clear()
+            stock_bot.process_update(self._update(text=command), "tok", set())
+            assert "Not configured" in sent[0][1]["text"], command
+
+    def test_starts_without_an_allowlist(self, mocker, monkeypatch):
+        # It used to exit here, which made the chat ID impossible to discover.
+        monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
+        monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+        mocker.patch("stock_bot._request", side_effect=KeyboardInterrupt)
+        stock_bot.main()  # returns cleanly rather than raising SystemExit
+
+    def test_still_refuses_without_a_token(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
+        with pytest.raises(SystemExit, match="TELEGRAM_TOKEN"):
+            stock_bot.main()
+
+    def test_configured_bot_does_not_leak_ids_to_strangers(self, sent, portfolio):
+        # Once configured, an unknown chat gets silence — not its own id back.
+        assert stock_bot.process_update(self._update(999), "tok", {"42"}) is False
+        assert sent == []

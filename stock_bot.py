@@ -4,7 +4,9 @@ Long-polls the Telegram Bot API and answers a handful of read-only commands.
 It reports; it never edits holdings and never places trades.
 
 Only chat IDs listed in ``TELEGRAM_ALLOWED_CHAT_IDS`` are answered — without
-that, anyone who finds the bot could read the portfolio.
+that, anyone who finds the bot could read the portfolio. With the allowlist
+empty the bot runs in setup mode: it reports the sender's own chat ID so it
+can be configured, and serves nothing else.
 
 Environment:
     TELEGRAM_TOKEN             bot token from @BotFather (required)
@@ -44,6 +46,15 @@ POLL_TIMEOUT = 30
 CACHE_TTL = 60
 
 DEFAULT_WIDTH = 42
+
+SETUP_REPLY = """<b>Not configured yet</b>
+
+Your chat ID is <code>{chat_id}</code>
+
+Set it and restart the bot:
+<code>TELEGRAM_ALLOWED_CHAT_IDS={chat_id}</code>
+
+Until then no portfolio data is served."""
 
 HELP = """<b>Portfolio bot</b>
 
@@ -258,8 +269,17 @@ def process_update(update, token, allowed, width=DEFAULT_WIDTH):
     if not chat_id or not text.startswith("/"):
         return False
 
+    if not allowed:
+        # Setup mode: the allowlist can't be filled in until you know your own
+        # chat ID, and the bot is the obvious place to ask. Telling a sender
+        # their own ID discloses nothing they don't already have; the
+        # portfolio stays behind the allowlist.
+        log.warning("unconfigured: reporting chat id %s to sender", chat_id)
+        send_message(token, chat_id, SETUP_REPLY.format(chat_id=chat_id))
+        return True
+
     if chat_id not in allowed:
-        # Say nothing useful to strangers, but leave a trace.
+        # Say nothing at all to strangers, but leave a trace.
         log.warning("ignoring command from chat %s", chat_id)
         return False
 
@@ -282,13 +302,15 @@ def main():
     allowed = _allowed_chat_ids(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS"))
     if not token:
         raise SystemExit("TELEGRAM_TOKEN is not set")
-    if not allowed:
-        # Refusing to start is deliberate: an open bot exposes the portfolio
-        # to anyone who finds it.
-        raise SystemExit("TELEGRAM_ALLOWED_CHAT_IDS is not set — refusing to serve")
 
     width = int(os.environ.get("STOCK_BOT_WIDTH", DEFAULT_WIDTH))
-    log.info("listening, serving %d chat(s)", len(allowed))
+    if allowed:
+        log.info("listening, serving %d chat(s)", len(allowed))
+    else:
+        log.warning(
+            "TELEGRAM_ALLOWED_CHAT_IDS is not set — setup mode: the bot will "
+            "reply with the sender's chat id and serve no portfolio data"
+        )
 
     offset = None
     backoff = 1
