@@ -12,6 +12,7 @@ A professional terminal-based portfolio tracker that provides real-time stock pr
 - 🥧 **Allocation**: Position weights and the currency you are really exposed to.
 - 🎯 **Analyst Consensus**: Shows the analyst rating and upside to the mean price target for each holding, with an arrow when the consensus shifted over the last month.
 - 🤖 **JSON Output**: `--json` emits the whole snapshot as structured data for scripts, dashboards, or an AI assistant.
+- 📱 **Telegram Bot**: Check the portfolio from your phone with `/portfolio`, `/holding`, `/dividends`.
 - 🔌 **MCP Server**: Let Claude (or any MCP client) read your portfolio and keep your holdings up to date as you buy and sell.
 - 📰 **Related News**: Shows recent business news articles for your portfolio tickers with summaries and clickable links.
 - 💰 **Dividends**: Upcoming ex-dividend dates plus the income actually received over the last 12 months, with yield and yield-on-cost.
@@ -227,6 +228,33 @@ records the purchase price as well as the share count.
 `set_holding` and `add_shares` mean different things — "I hold 15 in total"
 versus "I bought 5 more" — so it's worth confirming the numbers your assistant
 read back to you.
+
+## Telegram bot
+
+Check the portfolio from your phone. The bot is read-only — it reports, and
+cannot edit holdings or place trades.
+
+```bash
+pip install stock-price          # no extra dependencies needed
+export TELEGRAM_TOKEN="...";  export TELEGRAM_ALLOWED_CHAT_IDS="123456789"
+stock-price-bot
+```
+
+| Command | Shows |
+| --- | --- |
+| `/portfolio`, `/p` | Value, day and month change, rendered for a phone screen |
+| `/holding <TICKER>`, `/h` | One position in detail |
+| `/dividends`, `/d` | Upcoming payouts and 12-month income |
+| `/news`, `/n` | Recent headlines |
+
+`TELEGRAM_ALLOWED_CHAT_IDS` is required and the bot refuses to start without
+it. A Telegram bot answers anyone who finds it, so without an allowlist your
+portfolio is readable by a stranger who guesses the name.
+
+A ready-to-run Nomad job for a home cluster is in
+[`deploy/nomad/stock-bot.nomad.hcl`](deploy/nomad/stock-bot.nomad.hcl). It keeps
+the token in a Nomad Variable rather than the jobspec, and mounts a volume so
+the recorded portfolio history survives restarts.
 
 Tickers that fail to load (network/rate-limit errors or invalid symbols) are
 retried with backoff and, if still unavailable, shown as a stale `⚠` / `error`

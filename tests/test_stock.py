@@ -2847,9 +2847,18 @@ class TestResponsiveTable:
         assert "Target" not in headers
 
     def test_dropped_columns_are_named_in_the_footer(self):
+        # A couple of drops are listed by name...
+        out = _render_at(self._group(120), 120)
+        note = out.split("narrow terminal")[1]
+        assert "Quantity" in note
+        assert "columns hidden" not in note
+
+    def test_many_dropped_columns_are_summarised(self):
+        # ...but on a phone the list would be longer than the table itself.
         out = _render_at(self._group(100), 100)
-        assert "narrow terminal" in out
-        assert "Quantity" in out.split("narrow terminal")[1]
+        note = out.split("narrow terminal")[1]
+        assert "columns hidden" in note
+        assert "Quantity" not in note
 
     def test_no_footer_note_when_nothing_is_dropped(self):
         out = _render_at(self._group(200), 200)

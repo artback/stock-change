@@ -1758,7 +1758,9 @@ def collect_portfolio(
 #
 # Summary keeps the ticker, what it is worth and how it moved today. Dividends
 # keeps the ticker, the next date and the income actually received.
-_SUMMARY_SHED_ORDER = ("daily_value", "quantity", "target", "pl", "analysts", "month")
+_SUMMARY_SHED_ORDER = (
+    "daily_value", "quantity", "target", "pl", "analysts", "month", "return",
+)
 _DIVIDEND_SHED_ORDER = ("amount", "on_cost", "yield", "next")
 
 
@@ -1770,15 +1772,19 @@ def _table_width(columns):
 
 
 def _fit_columns(columns, available, shed_order):
-    """Drop optional columns, least useful first, until the table fits.
+    """Make a table fit ``available`` columns without Rich truncating it.
 
-    Returns ``(visible_columns, dropped_headers)`` so the caller can tell the
-    user what is missing rather than hiding it silently.
+    First drop optional columns, least useful first. Then narrow whatever is
+    left toward its minimum: on a phone even ticker + value + day % is wider
+    than the screen, and a column squeezed to "+1.8…" is worse than a narrow
+    one. Returns ``(visible_columns, dropped_headers)`` so the caller can say
+    what went rather than hiding it silently.
     """
     visible = list(columns)
     dropped = []
     if not available:
         return visible, dropped
+
     for key in shed_order:
         if _table_width(visible) <= available:
             break
@@ -1787,6 +1793,13 @@ def _fit_columns(columns, available, shed_order):
             continue
         visible.remove(match)
         dropped.append(match["header"])
+
+    while _table_width(visible) > available:
+        slack = [c for c in visible if c["width"] > c.get("min", c["width"])]
+        if not slack:
+            break
+        max(slack, key=lambda c: c["width"])["width"] -= 1
+
     return visible, dropped
 
 
@@ -1908,12 +1921,13 @@ def build_display_group(
 
     # 1. Summary Table (No expand=True to keep it compact)
     wanted = [
-        {"key": "ticker", "header": "Ticker", "width": 12, "justify": "left"},
-        {"key": "quantity", "header": "Quantity", "width": 10, "justify": "right"},
+        {"key": "ticker", "header": "Ticker", "width": 12, "min": 10, "justify": "left"},
+        {"key": "quantity", "header": "Quantity", "width": 10, "min": 8, "justify": "right"},
         {
             "key": "value",
             "header": f"Value ({target_symbol})",
             "width": 15,
+            "min": 12,
             "justify": "right",
             "style": "bold white",
         },
@@ -1921,10 +1935,11 @@ def build_display_group(
             "key": "daily_value",
             "header": f"Daily ({target_symbol})",
             "width": 12,
+            "min": 10,
             "justify": "right",
         },
-        {"key": "day", "header": "Day %", "width": 9, "justify": "right"},
-        {"key": "month", "header": "Month %", "width": 9, "justify": "right"},
+        {"key": "day", "header": "Day %", "width": 9, "min": 7, "justify": "right"},
+        {"key": "month", "header": "Month %", "width": 9, "min": 7, "justify": "right"},
     ]
     if show_returns:
         wanted += [
@@ -1932,14 +1947,15 @@ def build_display_group(
                 "key": "pl",
                 "header": f"P/L ({target_symbol})",
                 "width": 14,
+                "min": 11,
                 "justify": "right",
             },
-            {"key": "return", "header": "Return %", "width": 9, "justify": "right"},
+            {"key": "return", "header": "Return %", "width": 9, "min": 8, "justify": "right"},
         ]
     if show_analysts:
         wanted += [
-            {"key": "analysts", "header": "Analysts", "width": 15, "justify": "right"},
-            {"key": "target", "header": "Target", "width": 8, "justify": "right"},
+            {"key": "analysts", "header": "Analysts", "width": 15, "min": 15, "justify": "right"},
+            {"key": "target", "header": "Target", "width": 8, "min": 7, "justify": "right"},
         ]
 
     available = max_width if max_width is not None else console.width
@@ -2088,13 +2104,14 @@ def build_display_group(
     div_table = None
     if upcoming or income:
         div_wanted = [
-            {"key": "ticker", "header": "Ticker", "width": 12, "justify": "left"},
-            {"key": "ex_date", "header": "Ex-Date", "width": 12, "justify": "center"},
-            {"key": "amount", "header": "Amount", "width": 12, "justify": "right"},
+            {"key": "ticker", "header": "Ticker", "width": 12, "min": 10, "justify": "left"},
+            {"key": "ex_date", "header": "Ex-Date", "width": 12, "min": 11, "justify": "center"},
+            {"key": "amount", "header": "Amount", "width": 12, "min": 9, "justify": "right"},
             {
                 "key": "next",
                 "header": f"Next ({target_symbol})",
                 "width": 14,
+                "min": 11,
                 "justify": "right",
                 "style": "green",
             },
@@ -2102,10 +2119,11 @@ def build_display_group(
                 "key": "income",
                 "header": f"12M Income ({target_symbol})",
                 "width": 18,
+                "min": 12,
                 "justify": "right",
                 "style": "green",
             },
-            {"key": "yield", "header": "Yield", "width": 8, "justify": "right"},
+            {"key": "yield", "header": "Yield", "width": 8, "min": 7, "justify": "right"},
         ]
         if show_on_cost:
             div_wanted.append(
@@ -2275,10 +2293,11 @@ def build_display_group(
     if dropped_columns:
         if footer_text:
             footer.append(" | ", style="dim")
-        footer.append(
-            f"narrow terminal — hidden: {', '.join(dropped_columns)}",
-            style="dim italic",
-        )
+        if len(dropped_columns) > 3:
+            note = f"narrow terminal — {len(dropped_columns)} columns hidden"
+        else:
+            note = f"narrow terminal — hidden: {', '.join(dropped_columns)}"
+        footer.append(note, style="dim italic")
 
     # The tables are the point of the tool, so they are never shed; the
     # decorations around them are. Without this the whole summary scrolls off

@@ -1,0 +1,248 @@
+"""Tests for the Telegram bot.
+
+Telegram itself is never contacted: ``_request`` is the single seam through
+which every API call passes, so patching it covers the whole surface.
+"""
+
+import html
+import re
+
+import pytest
+
+import stock_bot
+
+
+def _plain(text):
+    """Strip the HTML the bot sends so assertions read naturally."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text or ""))
+
+
+@pytest.fixture
+def sent(mocker):
+    """Capture outgoing messages instead of calling Telegram."""
+    calls = []
+
+    def fake(token, method, params=None, timeout=None):
+        calls.append((method, params or {}))
+        return []
+
+    mocker.patch("stock_bot._request", side_effect=fake)
+    return calls
+
+
+@pytest.fixture
+def portfolio(mocker):
+    """A small deterministic portfolio, so no network and no live prices."""
+    mocker.patch(
+        "stock.load_config",
+        return_value={
+            "holdings": {"MC.PA": 45, "IUSA.DE": 720},
+            "currency": "EUR",
+            "cost_basis": {"MC.PA": 400.0},
+            "benchmark": None,
+        },
+    )
+    summaries = {
+        "MC.PA": {
+            "symbol": "MC.PA", "qty": 45, "val_now": 21381.75, "val_prev": 21000.0,
+            "chg_pct": 1.82, "daily_chg_val": 381.75, "source_currency": "EUR",
+            "conv": 1.0, "price": 475.15, "cost": 400.0, "cost_value": 18000.0,
+            "unrealized": 3381.75, "return_pct": 18.79,
+        },
+        "IUSA.DE": {
+            "symbol": "IUSA.DE", "qty": 720, "val_now": 46340.64, "val_prev": 46000.0,
+            "chg_pct": 0.74, "daily_chg_val": 340.64, "source_currency": "EUR",
+            "conv": 1.0, "price": 64.36,
+        },
+    }
+    mocker.patch(
+        "stock.fetch_summaries",
+        return_value=(summaries, {"MC.PA": "EUR", "IUSA.DE": "EUR"}, []),
+    )
+    mocker.patch(
+        "stock.fetch_auxiliary",
+        return_value={
+            "history": [100.0, 110.0], "monthly": {"MC.PA": -2.23}, "traded": None,
+            "dividends": {
+                "MC.PA": {
+                    "symbol": "MC.PA", "ex_date": "2026-12-01", "amt": 5.5,
+                    "total_p": 247.5, "cur_label": "€", "ttm_per_share": 13.0,
+                    "ttm_total": 585.0, "yield_pct": 2.74,
+                    "yield_on_cost_pct": 3.25,
+                }
+            },
+            "news": [
+                {"symbol": "MC.PA", "title": "LVMH does something",
+                 "link": "https://example.com/a", "provider": "Reuters",
+                 "pub_date": "2026-08-03 10:00", "summary": "A summary."}
+            ],
+            "analysts": {
+                "MC.PA": {
+                    "consensus": "Buy", "trend": "steady", "analyst_count": 25,
+                    "price_target": {"upside_pct": 19.8},
+                }
+            },
+        },
+    )
+    mocker.patch("stock.record_portfolio_value", return_value=None)
+    mocker.patch("stock.load_portfolio_history", return_value=[])
+
+
+class TestAccessControl:
+    """The bot answers a private portfolio; the allowlist is the whole defence."""
+
+    def _update(self, chat_id, text="/portfolio"):
+        return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
+
+    def test_allowed_chat_is_answered(self, sent, portfolio):
+        assert (
+            stock_bot.process_update(self._update(42), "tok", {"42"}) is True
+        )
+        assert sent[0][0] == "sendMessage"
+
+    def test_unknown_chat_gets_nothing(self, sent, portfolio):
+        assert stock_bot.process_update(self._update(999), "tok", {"42"}) is False
+        assert sent == []
+
+    def test_no_reply_leaks_data_to_a_stranger(self, sent, portfolio):
+        stock_bot.process_update(self._update(999), "tok", {"42"})
+        assert not any("MC.PA" in str(params) for _, params in sent)
+
+    def test_empty_allowlist_refuses_to_start(self, monkeypatch):
+        # An open bot exposes the portfolio to anyone who finds it.
+        monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
+        monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+        with pytest.raises(SystemExit, match="ALLOWED_CHAT_IDS"):
+            stock_bot.main()
+
+    def test_missing_token_refuses_to_start(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
+        with pytest.raises(SystemExit, match="TELEGRAM_TOKEN"):
+            stock_bot.main()
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("42", {"42"}),
+            ("42,-100", {"42", "-100"}),
+            (" 42 , -100 ", {"42", "-100"}),
+            ("", set()),
+            (None, set()),
+        ],
+    )
+    def test_allowlist_parsing(self, raw, expected):
+        assert stock_bot._allowed_chat_ids(raw) == expected
+
+
+class TestUpdateHandling:
+    def test_non_message_updates_ignored(self, sent):
+        assert stock_bot.process_update({"update_id": 1}, "tok", {"42"}) is False
+
+    def test_plain_text_is_not_a_command(self, sent, portfolio):
+        update = {"update_id": 1, "message": {"chat": {"id": 42}, "text": "hello"}}
+        assert stock_bot.process_update(update, "tok", {"42"}) is False
+
+    def test_edited_messages_are_handled(self, sent, portfolio):
+        update = {
+            "update_id": 1,
+            "edited_message": {"chat": {"id": 42}, "text": "/help"},
+        }
+        assert stock_bot.process_update(update, "tok", {"42"}) is True
+
+    def test_a_failing_command_replies_instead_of_crashing(self, sent, mocker):
+        mocker.patch("stock_bot.handle_command", side_effect=RuntimeError("boom"))
+        update = {"update_id": 1, "message": {"chat": {"id": 42}, "text": "/portfolio"}}
+        assert stock_bot.process_update(update, "tok", {"42"}) is True
+        assert "went wrong" in sent[0][1]["text"]
+
+    def test_unknown_command_is_silent(self, sent, portfolio):
+        update = {"update_id": 1, "message": {"chat": {"id": 42}, "text": "/nope"}}
+        assert stock_bot.process_update(update, "tok", {"42"}) is False
+
+
+class TestCommands:
+    def test_help(self, portfolio):
+        assert "/portfolio" in stock_bot.handle_command("/help")
+
+    def test_start_is_help(self, portfolio):
+        assert stock_bot.handle_command("/start") == stock_bot.handle_command("/help")
+
+    def test_group_chat_suffix_is_stripped(self, portfolio):
+        assert stock_bot.handle_command("/help@my_bot") is not None
+
+    def test_portfolio(self, portfolio):
+        out = _plain(stock_bot.handle_command("/portfolio"))
+        assert "MC.PA" in out
+        assert "TOTAL" in out
+
+    def test_portfolio_fits_a_phone(self, portfolio):
+        out = _plain(stock_bot.handle_command("/portfolio"))
+        widest = max(len(line) for line in out.splitlines())
+        assert widest <= stock_bot.DEFAULT_WIDTH, widest
+
+    def test_portfolio_is_never_truncated(self, portfolio):
+        assert "…" not in _plain(stock_bot.handle_command("/portfolio"))
+
+    def test_portfolio_records_history(self, portfolio, mocker):
+        record = mocker.patch("stock.record_portfolio_value")
+        stock_bot.handle_command("/portfolio")
+        record.assert_called_once()
+
+    def test_holding(self, portfolio):
+        out = _plain(stock_bot.handle_command("/holding MC.PA"))
+        assert "21,381.75" in out
+        assert "+18.79%" in out
+        assert "Buy (25)" in out
+
+    def test_holding_is_case_insensitive(self, portfolio):
+        assert "21,381.75" in _plain(stock_bot.handle_command("/holding mc.pa"))
+
+    def test_holding_unknown_lists_what_is_held(self, portfolio):
+        out = _plain(stock_bot.handle_command("/holding NOPE"))
+        assert "not in the portfolio" in out
+        assert "MC.PA" in out
+
+    def test_holding_without_an_argument(self, portfolio):
+        assert "Usage" in _plain(stock_bot.handle_command("/holding"))
+
+    def test_dividends(self, portfolio):
+        out = _plain(stock_bot.handle_command("/dividends"))
+        assert "Dividends" in out
+        assert "585.00" in out
+
+    def test_news(self, portfolio):
+        out = stock_bot.handle_command("/news")
+        assert "LVMH does something" in out
+        assert "https://example.com/a" in out
+
+    def test_short_aliases(self, portfolio):
+        for alias in ("/p", "/d", "/n"):
+            assert stock_bot.handle_command(alias) is not None
+
+    def test_empty_message(self, portfolio):
+        assert stock_bot.handle_command("   ") is None
+
+
+class TestFormatting:
+    def test_code_block_escapes_html(self):
+        assert "&lt;b&gt;" in stock_bot.as_code_block("<b>")
+
+    def test_render_has_no_ansi_escapes(self):
+        # ANSI would appear as literal noise in a Telegram message.
+        from rich.text import Text
+
+        assert "\x1b" not in stock_bot.render(Text("hi", style="bold red"))
+
+    def test_long_messages_are_trimmed_to_the_limit(self, sent):
+        stock_bot.send_message("tok", 42, "x\n" * 5000)
+        assert len(sent[0][1]["text"]) <= stock_bot.MAX_MESSAGE
+        assert "truncated" in sent[0][1]["text"]
+
+    def test_short_messages_pass_through(self, sent):
+        stock_bot.send_message("tok", 42, "hello")
+        assert sent[0][1]["text"] == "hello"
+
+    def test_messages_are_sent_as_html(self, sent):
+        stock_bot.send_message("tok", 42, "hi")
+        assert sent[0][1]["parse_mode"] == "HTML"

@@ -34,6 +34,7 @@ dev = [
 [project.scripts]
 stock-price = "stock:fetch_portfolio"
 stock-price-mcp = "stock_mcp:main"
+stock-price-bot = "stock_bot:main"
 
 [tool.ruff.lint]
 # Stated explicitly rather than inherited. With `ruff` unpinned in the dev
@@ -71,7 +72,7 @@ show_missing = true
 fail_under = 60
 
 [tool.setuptools]
-py-modules = ["stock", "stock_mcp"]
+py-modules = ["stock", "stock_mcp", "stock_bot"]
 
 [tool.setuptools.dynamic]
 version = {file = "VERSION"}
