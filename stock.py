@@ -1790,6 +1790,57 @@ def _fit_columns(columns, available, shed_order):
     return visible, dropped
 
 
+# Panels given up when the output is taller than the terminal, least essential
+# first. Without this the summary table — the point of the tool — scrolls off
+# the top and you are left looking at the news.
+_PANEL_SHED_ORDER = ("news", "allocation", "trend")
+
+# Lines a news entry occupies: blank separator, headline meta, title, summary.
+_NEWS_ENTRY_LINES = 4
+
+
+def _rendered_height(renderable, width):
+    """How many lines this renderable actually takes at the given width."""
+    probe = Console(width=width, file=io.StringIO())
+    with probe.capture() as cap:
+        probe.print(renderable)
+    return len(cap.get().splitlines())
+
+
+def _build_news_panel(news_items):
+    """Render the headlines panel, or ``None`` when there is nothing to show."""
+    if not news_items:
+        return None
+    news_text = Text()
+    for i, item in enumerate(news_items):
+        if i > 0:
+            news_text.append("\n\n")
+        news_text.append(f"  {item['symbol']}", style="bold white")
+        news_text.append(f"  {item['pub_date']}", style="dim")
+        if item.get("provider"):
+            news_text.append(f"  {item['provider']}", style="dim italic")
+        news_text.append("\n  ")
+        title_text = Text(item["title"])
+        if item.get("link"):
+            title_text.stylize(f"link {item['link']}")
+            title_text.stylize("underline bright_cyan")
+        else:
+            title_text.stylize("bright_cyan")
+        news_text.append_text(title_text)
+        if item.get("summary"):
+            summary = item["summary"]
+            if len(summary) > 200:
+                summary = summary[:200].rsplit(" ", 1)[0] + "..."
+            news_text.append(f"\n  {summary}", style="dim")
+    return Panel(
+        news_text,
+        title=f"Related News ({len(news_items)})",
+        border_style="yellow",
+        expand=False,
+        padding=(1, 2),
+    )
+
+
 def _return_cells(summary, target_symbol):
     """Render the (unrealized P/L, return %) cells for one holding."""
     unrealized = summary.get("unrealized")
@@ -1844,6 +1895,7 @@ def build_display_group(
     benchmark=None,
     portfolio_history=None,
     max_width=None,
+    max_height=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     monthly_changes = monthly_changes or {}
@@ -2030,6 +2082,9 @@ def build_display_group(
     # the trailing year. A holding can have one without the other.
     upcoming = [d for d in dividend_results if d.get("ex_date")]
     income = [d for d in dividend_results if d.get("ttm_total")]
+    show_on_cost = any(
+        d.get("yield_on_cost_pct") is not None for d in dividend_results
+    )
     div_table = None
     if upcoming or income:
         div_wanted = [
@@ -2051,8 +2106,11 @@ def build_display_group(
                 "style": "green",
             },
             {"key": "yield", "header": "Yield", "width": 8, "justify": "right"},
-            {"key": "on_cost", "header": "On Cost", "width": 9, "justify": "right"},
         ]
+        if show_on_cost:
+            div_wanted.append(
+                {"key": "on_cost", "header": "On Cost", "width": 9, "justify": "right"}
+            )
         div_columns, div_dropped = _fit_columns(
             div_wanted, available, _DIVIDEND_SHED_ORDER
         )
@@ -2209,36 +2267,8 @@ def build_display_group(
         )
 
     # 4. News Panel
-    news_panel = None
-    if news_items:
-        news_text = Text()
-        for i, item in enumerate(news_items):
-            if i > 0:
-                news_text.append("\n\n")
-            news_text.append(f"  {item['symbol']}", style="bold white")
-            news_text.append(f"  {item['pub_date']}", style="dim")
-            if item["provider"]:
-                news_text.append(f"  {item['provider']}", style="dim italic")
-            news_text.append("\n  ")
-            title_text = Text(item["title"])
-            if item["link"]:
-                title_text.stylize(f"link {item['link']}")
-                title_text.stylize("underline bright_cyan")
-            else:
-                title_text.stylize("bright_cyan")
-            news_text.append_text(title_text)
-            if item.get("summary"):
-                summary = item["summary"]
-                if len(summary) > 200:
-                    summary = summary[:200].rsplit(" ", 1)[0] + "..."
-                news_text.append(f"\n  {summary}", style="dim")
-        news_panel = Panel(
-            news_text,
-            title="Related News",
-            border_style="yellow",
-            expand=False,
-            padding=(1, 2),
-        )
+    news_items = list(news_items or ())
+    news_panel = _build_news_panel(news_items)
 
     # 5. Footer
     footer = Text(footer_text, style="dim italic") if footer_text else Text("")
@@ -2250,15 +2280,54 @@ def build_display_group(
             style="dim italic",
         )
 
+    # The tables are the point of the tool, so they are never shed; the
+    # decorations around them are. Without this the whole summary scrolls off
+    # the top of the terminal and you are left looking at the news.
+    panels = {"news": news_panel, "allocation": allocation_panel, "trend": summary_panel}
+    height_budget = max_height if max_height is not None else console.height
+    dropped_panels = []
+
+    if height_budget:
+        fixed = _rendered_height(table, available) + 1
+        if div_table:
+            fixed += _rendered_height(div_table, available)
+
+        def panels_height():
+            return sum(
+                _rendered_height(panel, available)
+                for panel in panels.values()
+                if panel is not None
+            )
+
+        # Headlines are the most compressible thing here: showing five instead
+        # of fifteen keeps the section useful and buys back most of the space.
+        while (
+            panels["news"] is not None
+            and len(news_items) > 1
+            and fixed + panels_height() > height_budget
+        ):
+            news_items = news_items[: len(news_items) - 1]
+            panels["news"] = _build_news_panel(news_items)
+
+        for key in _PANEL_SHED_ORDER:
+            if fixed + panels_height() <= height_budget:
+                break
+            if panels.get(key) is not None:
+                panels[key] = None
+                dropped_panels.append(key)
+
+    if dropped_panels:
+        note = f"hidden to fit the window: {', '.join(dropped_panels)}"
+        if footer.plain:
+            footer.append(" | ", style="dim")
+        footer.append(note, style="dim italic")
+
     elements = [table]
     if div_table:
         elements.append(div_table)
-    if news_panel:
-        elements.append(news_panel)
-    if allocation_panel:
-        elements.append(allocation_panel)
-    if summary_panel:
-        elements.append(summary_panel)
+    for key in ("news", "allocation", "trend"):
+        if panels[key] is not None:
+            elements.append(panels[key])
     elements.append(footer)
 
     return Group(*elements)

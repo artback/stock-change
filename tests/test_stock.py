@@ -74,12 +74,13 @@ from stock import (
 
 @pytest.fixture(autouse=True)
 def _fixed_console_width(monkeypatch):
-    """Pin the console width so column shedding is deterministic.
+    """Pin the console size so shedding is deterministic.
 
-    Under pytest the module console is 80 wide, but the helpers below render
-    at 120 — without this the two disagree and columns vanish unexpectedly.
+    Under pytest the module console is 80x25, but the helpers below render at
+    120 — without this the two disagree, columns vanish unexpectedly, and the
+    short default height silently drops panels.
     """
-    monkeypatch.setattr(stock_module, "console", Console(width=120))
+    monkeypatch.setattr(stock_module, "console", Console(width=120, height=100))
 
 
 def _render(group):
@@ -3034,3 +3035,108 @@ class TestAddSharesAveragesCost:
         # set_holding means "this is the position", so replacing is right.
         set_holding("AAPL", 20, cost=42.0)
         assert self._cost(config) == 42.0
+
+
+# ---------------------------------------------------------------------------
+# fitting the output to the terminal height
+# ---------------------------------------------------------------------------
+
+
+class TestVerticalFit:
+    def _summaries(self, count=8):
+        return [
+            {
+                "symbol": f"TICK{i}.ST", "qty": 100, "val_now": 1000.0,
+                "val_prev": 1000.0, "chg_pct": 0.0, "daily_chg_val": 0.0,
+                "source_currency": "SEK", "conv": 1.0,
+            }
+            for i in range(count)
+        ]
+
+    def _news(self, count=15):
+        return [
+            {
+                "symbol": "TICK0.ST", "title": f"Headline number {i}",
+                "link": "", "provider": "Reuters", "pub_date": "2026-08-02 10:00",
+                "summary": "A reasonably long summary sentence for this story.",
+            }
+            for i in range(count)
+        ]
+
+    def _dividends(self):
+        return [{
+            "symbol": "TICK0.ST", "ex_date": date(2099, 1, 1), "amt": 1.0,
+            "total_p": 10.0, "cur_label": "kr", "ttm_per_share": 1.0,
+            "ttm_total": 100.0, "yield_pct": 2.0, "yield_on_cost_pct": None,
+        }]
+
+    def _group(self, height):
+        return build_display_group(
+            self._summaries(), self._dividends(), "EUR",
+            history_points=[100.0, 105.0, 103.0, 110.0],
+            news_items=self._news(), max_width=150, max_height=height,
+        )
+
+    @pytest.mark.parametrize("height", [24, 30, 45, 60, 200])
+    def test_output_fits_the_terminal(self, height):
+        out = _render_at(self._group(height), 150)
+        assert len(out.splitlines()) <= height, out
+
+    def test_tall_terminal_keeps_everything(self):
+        out = _render_at(self._group(200), 150)
+        assert "Related News" in out
+        assert "Allocation" in out
+        assert "30D" in out
+
+    def test_the_summary_table_always_survives(self):
+        # Shedding exists so this never scrolls away; it is the whole point.
+        for height in (24, 30, 45, 60, 200):
+            out = _render_at(self._group(height), 150)
+            assert "Portfolio Summary" in out
+            assert "TOTAL" in out
+
+    def test_news_is_trimmed_before_it_is_dropped(self):
+        out = _render_at(self._group(60), 150)
+        assert "Related News" in out
+        # The count in the title says how many survived.
+        assert "Related News (15)" not in out
+
+    def test_news_goes_before_allocation(self):
+        out = _render_at(self._group(45), 150)
+        assert "Related News" not in out
+
+    def test_dropped_panels_are_named_in_the_footer(self):
+        out = _render_at(self._group(45), 150)
+        assert "hidden to fit the window" in out
+        assert "news" in out.split("hidden to fit the window")[1]
+
+    def test_no_footer_note_when_everything_fits(self):
+        out = _render_at(self._group(200), 150)
+        assert "hidden to fit the window" not in out
+
+
+class TestOnCostColumnVisibility:
+    def _summary(self):
+        return {
+            "symbol": "AAPL", "qty": 10, "val_now": 1000.0, "val_prev": 1000.0,
+            "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "USD",
+        }
+
+    def _dividend(self, on_cost=None):
+        return {
+            "symbol": "AAPL", "ex_date": None, "amt": None, "total_p": None,
+            "cur_label": "$", "ttm_per_share": 1.0, "ttm_total": 10.0,
+            "yield_pct": 1.0, "yield_on_cost_pct": on_cost,
+        }
+
+    def test_hidden_when_no_holding_has_a_cost_basis(self):
+        # A column of nothing but dashes is noise.
+        out = _render(build_display_group([self._summary()], [self._dividend()], "USD"))
+        assert "On Cost" not in out
+
+    def test_shown_once_a_cost_basis_exists(self):
+        out = _render(
+            build_display_group([self._summary()], [self._dividend(on_cost=4.0)], "USD")
+        )
+        assert "On Cost" in out
+        assert "4.00%" in out
