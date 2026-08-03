@@ -469,3 +469,34 @@ class TestCaching:
         stock_bot.handle_command("/holding MC.PA")
         assert fetches.call_count == 2
         assert aux.call_count == 1
+
+
+class TestTickerLinks:
+    def test_portfolio_tickers_link_to_yahoo(self, portfolio):
+        out = stock_bot.handle_command("/portfolio")
+        assert 'href="https://finance.yahoo.com/quote/MC.PA"' in out
+        assert "<b>MC.PA</b></a>" in out
+
+    def test_holding_header_links(self, portfolio):
+        assert "finance.yahoo.com/quote/MC.PA" in stock_bot.handle_command(
+            "/holding MC.PA"
+        )
+
+    def test_allocation_links(self, portfolio):
+        assert "finance.yahoo.com/quote/" in stock_bot.handle_command("/allocation")
+
+    def test_dividends_link(self, portfolio):
+        assert "finance.yahoo.com/quote/" in stock_bot.handle_command("/dividends")
+
+    def test_symbols_are_url_encoded(self):
+        # Index symbols carry a caret, which is not valid raw in a URL.
+        assert "%5EGSPC" in stock_bot._ticker("^GSPC")
+
+    def test_link_text_stays_readable(self, portfolio):
+        # The href is encoded; the visible label must not be.
+        assert "<b>MC.PA</b>" in stock_bot._ticker("MC.PA")
+
+    def test_previews_stay_disabled(self, sent):
+        # Eight linked tickers would otherwise expand into preview cards.
+        stock_bot.send_message("tok", 42, "hi")
+        assert sent[0][1]["disable_web_page_preview"] == "true"

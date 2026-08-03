@@ -201,6 +201,10 @@ def _snapshot(width=DEFAULT_WIDTH, *, sections=()):
     return config, currency, summaries, aux, failed
 
 
+# Tapping a ticker should go somewhere useful. Link previews are disabled on
+# outgoing messages, so these stay inline rather than expanding into cards.
+YAHOO_QUOTE = "https://finance.yahoo.com/quote/"
+
 UP = "\U0001f7e2"
 DOWN = "\U0001f534"
 FLAT = "\u26aa"
@@ -215,6 +219,12 @@ def _dot(value):
     return UP if value > 0 else DOWN if value < 0 else FLAT
 
 
+def _ticker(symbol):
+    """A ticker as a bold link to its Yahoo Finance quote page."""
+    url = YAHOO_QUOTE + urllib.parse.quote(symbol)
+    return f'<a href="{html.escape(url)}"><b>{html.escape(symbol)}</b></a>'
+
+
 def _line(symbol, value, change=None):
     """One holding as a chat line: marker, bold ticker, then the figures.
 
@@ -222,7 +232,7 @@ def _line(symbol, value, change=None):
     proportional font, so padding buys nothing and a monospace block to force
     it reads like a terminal dump on a phone.
     """
-    parts = [f"{_dot(change if change is not None else 0)} <b>{html.escape(symbol)}</b>"]
+    parts = [f"{_dot(change if change is not None else 0)} {_ticker(symbol)}"]
     parts.append(html.escape(value))
     if change is not None:
         parts.append(f"{change:+.2f}%")
@@ -320,7 +330,7 @@ def cmd_allocation(width=DEFAULT_WIDTH):
         # A repeated block character keeps its width in a proportional font,
         # so the bars still line up without a monospace block.
         bar = "\u2588" * max(1, round(weight / 5))
-        lines.append(f"{bar} <b>{html.escape(s['symbol'])}</b> {weight:.1f}%")
+        lines.append(f"{bar} {_ticker(s['symbol'])} {weight:.1f}%")
 
     by_currency = {}
     for s in positions:
@@ -355,7 +365,7 @@ def cmd_holding(symbol_arg, width=DEFAULT_WIDTH):
 
     symbol = stock.CURRENCY_SYMBOLS.get(currency, currency)
     lines = [
-        f"{_dot(match.get('chg_pct') or 0)} <b>{html.escape(match['symbol'])}</b>",
+        f"{_dot(match.get('chg_pct') or 0)} {_ticker(match['symbol'])}",
         "",
         f"<b>{html.escape(_money(match['val_now'], symbol))}</b> "
         f"\u00b7 {match['qty']:,} shares",
@@ -404,7 +414,7 @@ def cmd_dividends(width=DEFAULT_WIDTH):
         )
         parts.append(
             "\n".join(
-                f"\u00b7 <b>{html.escape(d['symbol'])}</b> "
+                f"\u00b7 {_ticker(d['symbol'])} "
                 f"{html.escape(_money(d['ttm_total'], symbol))} "
                 f"({(d.get('yield_pct') or 0):.2f}%)"
                 for d in earning
@@ -418,7 +428,7 @@ def cmd_dividends(width=DEFAULT_WIDTH):
         parts.append(
             "\U0001f4c5 <b>Upcoming</b>\n"
             + "\n".join(
-                f"\u00b7 <b>{html.escape(d['symbol'])}</b> {d['ex_date']} "
+                f"\u00b7 {_ticker(d['symbol'])} {d['ex_date']} "
                 f"\u2192 {html.escape(_money(d['total_p'], symbol))}"
                 for d in upcoming
             )
@@ -437,7 +447,7 @@ def cmd_news(limit=5):
         link = item.get("link")
         headline = f'<a href="{html.escape(link)}">{title}</a>' if link else title
         blocks.append(
-            f"<b>{html.escape(item['symbol'])}</b> "
+            f"{_ticker(item['symbol'])} "
             f"\u00b7 <i>{html.escape(item['pub_date'])}</i>\n{headline}"
         )
     return "\n\n".join(blocks)

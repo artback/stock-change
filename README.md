@@ -242,7 +242,7 @@ stock-price-bot
 
 | Command | Shows |
 | --- | --- |
-| `/portfolio`, `/p` | Value, day change and P/L, biggest holding first |
+| `/portfolio`, `/p` | Value, day change and P/L, biggest holding first. Tickers link to Yahoo Finance |
 | `/holding <TICKER>`, `/h` | One position in detail |
 | `/dividends`, `/d` | Upcoming payouts and 12-month income |
 | `/allocation`, `/a` | Position weights and currency exposure |
