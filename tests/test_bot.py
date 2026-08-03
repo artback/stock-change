@@ -6,6 +6,7 @@ which every API call passes, so patching it covers the whole surface.
 
 import html
 import re
+import time
 
 import pytest
 
@@ -15,6 +16,14 @@ import stock_bot
 def _plain(text):
     """Strip the HTML the bot sends so assertions read naturally."""
     return html.unescape(re.sub(r"<[^>]+>", "", text or ""))
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    """The bot caches between commands; tests must not inherit each other's."""
+    stock_bot._cache.clear()
+    yield
+    stock_bot._cache.clear()
 
 
 @pytest.fixture
@@ -363,3 +372,100 @@ class TestPartialCostBasis:
         }
         mocker.patch("stock.fetch_summaries", return_value=(summaries, {}, []))
         assert "all time" not in _plain(stock_bot.handle_command("/portfolio"))
+
+
+class TestFetching:
+    """Every command used to refetch everything, which is what made replies
+    slow on a Pi. Each now asks only for what it renders, and reuses anything
+    still fresh."""
+
+    @pytest.fixture
+    def aux(self, portfolio, mocker):
+        return mocker.patch(
+            "stock.fetch_auxiliary",
+            return_value={"history": [1.0, 2.0], "monthly": {}, "traded": None,
+                          "dividends": {}, "news": [], "analysts": {}},
+        )
+
+    def _wants(self, call):
+        return {k: v for k, v in call.kwargs.items() if k.startswith("want_")}
+
+    def test_portfolio_does_not_fetch_news_or_analysts(self, aux):
+        stock_bot.handle_command("/portfolio")
+        wants = self._wants(aux.call_args)
+        assert wants["want_history"] is True
+        assert wants["want_news"] is False
+        assert wants["want_dividends"] is False
+        assert wants["want_analysts"] is False
+
+    def test_dividends_fetches_only_dividends(self, aux):
+        stock_bot.handle_command("/dividends")
+        wants = self._wants(aux.call_args)
+        assert wants["want_dividends"] is True
+        assert wants["want_news"] is False
+        assert wants["want_analysts"] is False
+
+    def test_news_fetches_only_news(self, aux):
+        stock_bot.handle_command("/news")
+        wants = self._wants(aux.call_args)
+        assert wants["want_news"] is True
+        assert wants["want_history"] is False
+
+    def test_holding_fetches_analysts(self, aux):
+        stock_bot.handle_command("/holding MC.PA")
+        assert self._wants(aux.call_args)["want_analysts"] is True
+
+    def test_allocation_needs_no_auxiliary_fetch_at_all(self, aux):
+        stock_bot.handle_command("/allocation")
+        aux.assert_not_called()
+
+
+class TestCaching:
+    @pytest.fixture
+    def fetches(self, portfolio, mocker):
+        mocker.patch(
+            "stock.fetch_auxiliary",
+            return_value={"history": [1.0, 2.0], "monthly": {}, "traded": None,
+                          "dividends": {}, "news": [], "analysts": {}},
+        )
+        return mocker.patch(
+            "stock.fetch_summaries",
+            return_value=({"MC.PA": {
+                "symbol": "MC.PA", "qty": 45, "val_now": 21381.75,
+                "val_prev": 21000.0, "chg_pct": 1.82, "daily_chg_val": 381.75,
+                "source_currency": "EUR", "conv": 1.0, "price": 475.15,
+            }}, {"MC.PA": "EUR"}, []),
+        )
+
+    def test_repeat_commands_reuse_prices(self, fetches):
+        stock_bot.handle_command("/portfolio")
+        stock_bot.handle_command("/portfolio")
+        assert fetches.call_count == 1
+
+    def test_different_commands_share_the_price_fetch(self, fetches):
+        stock_bot.handle_command("/portfolio")
+        stock_bot.handle_command("/allocation")
+        stock_bot.handle_command("/holding MC.PA")
+        assert fetches.call_count == 1
+
+    def test_prices_refresh_once_stale(self, fetches, mocker):
+        stock_bot.handle_command("/portfolio")
+        clock = [time.monotonic() + stock_bot.SUMMARY_TTL + 1]
+        mocker.patch("stock_bot.time.monotonic", side_effect=lambda: clock[0])
+        stock_bot.handle_command("/portfolio")
+        assert fetches.call_count == 2
+
+    def test_slow_sections_outlive_prices(self, fetches, mocker):
+        # Analyst ratings change over days; refetching them whenever a price
+        # goes stale would put the slowest calls back on every command.
+        aux = mocker.patch(
+            "stock.fetch_auxiliary",
+            return_value={"analysts": {}, "history": [], "monthly": {},
+                          "traded": None},
+        )
+        stock_bot.handle_command("/holding MC.PA")
+        clock = [time.monotonic() + stock_bot.SUMMARY_TTL + 1]
+        mocker.patch("stock_bot.time.monotonic", side_effect=lambda: clock[0])
+        stock_bot.handle_command("/holding MC.PA")
+        assert fetches.call_count == 2
+        assert aux.call_count == 1

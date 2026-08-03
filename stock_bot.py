@@ -41,9 +41,13 @@ MAX_MESSAGE = 4096
 # arrives, so this costs nothing while idle and responds instantly.
 POLL_TIMEOUT = 30
 
-# Portfolio fetches are the slow part; a short cache keeps repeated commands
-# snappy without serving anything meaningfully stale.
-CACHE_TTL = 60
+# Every command used to refetch everything, which on a Pi meant a long wait
+# per message. Sections are cached for as long as they stay meaningful —
+# prices move constantly, analyst ratings and dividend schedules do not — and
+# each command asks only for what it actually shows.
+SUMMARY_TTL = 60
+HISTORY_TTL = 300
+SLOW_TTL = 600
 
 DEFAULT_WIDTH = 42
 
@@ -113,28 +117,86 @@ def as_code_block(text):
     return f"<pre>{html.escape(text)}</pre>"
 
 
+_cache = {}
+
+
+def _cached(key, ttl, produce):
+    """Return a cached value, refreshing it once it is older than ``ttl``."""
+    now = time.monotonic()
+    entry = _cache.get(key)
+    if entry is not None and now - entry[0] < ttl:
+        return entry[1]
+    value = produce()
+    _cache[key] = (now, value)
+    return value
+
+
 def _config():
     config = stock.load_config()
     return config, (config["currency"] or "EUR").upper()
 
 
-def _snapshot(width=DEFAULT_WIDTH):
-    """Fetch the portfolio and render the summary table for a phone."""
+# Which auxiliary sections each command needs, and how long each stays fresh.
+_AUX_TTL = {
+    "history": HISTORY_TTL,
+    "dividends": SLOW_TTL,
+    "news": SLOW_TTL,
+    "analysts": SLOW_TTL,
+}
+
+
+def _snapshot(width=DEFAULT_WIDTH, *, sections=()):
+    """Fetch what a command needs, reusing anything still fresh.
+
+    ``sections`` names the auxiliary data to include. Asking for everything on
+    every command was the single biggest cause of slow replies: a /portfolio
+    was paying for news, dividends and analyst ratings it never shows.
+    """
     config, currency = _config()
-    summaries, ticker_to_currency, failed = stock.fetch_summaries(
-        config["holdings"], currency, {}, {}, cost_basis=config.get("cost_basis")
+
+    summaries, ticker_to_currency, failed = _cached(
+        "summaries",
+        SUMMARY_TTL,
+        lambda: stock.fetch_summaries(
+            config["holdings"], currency, {}, {}, cost_basis=config.get("cost_basis")
+        ),
     )
-    aux = stock.fetch_auxiliary(
-        config["holdings"],
-        currency,
-        summaries,
-        ticker_to_currency,
-        want_history=bool(ticker_to_currency),
-        want_dividends=bool(summaries),
-        want_news=bool(summaries),
-        want_analysts=bool(summaries),
-        benchmark=config.get("benchmark"),
-    )
+
+    aux = {}
+    stale = []
+    for name in sections:
+        entry = _cache.get(f"aux:{name}")
+        if entry is not None and time.monotonic() - entry[0] < _AUX_TTL[name]:
+            aux.update(entry[1])
+        else:
+            stale.append(name)
+
+    if stale and summaries:
+        fresh = stock.fetch_auxiliary(
+            config["holdings"],
+            currency,
+            summaries,
+            ticker_to_currency,
+            want_history="history" in stale,
+            want_dividends="dividends" in stale,
+            want_news="news" in stale,
+            want_analysts="analysts" in stale,
+            benchmark=config.get("benchmark"),
+        )
+        now = time.monotonic()
+        # history carries monthly/traded/benchmark along with it, so each
+        # section is cached as the group of keys it actually produced.
+        groups = {
+            "history": ("history", "monthly", "traded", "benchmark"),
+            "dividends": ("dividends",),
+            "news": ("news",),
+            "analysts": ("analysts",),
+        }
+        for name in stale:
+            section = {k: fresh[k] for k in groups[name] if k in fresh}
+            _cache[f"aux:{name}"] = (now, section)
+            aux.update(section)
+
     stock.apply_holiday_zeroing(summaries, aux.get("traded"))
     return config, currency, summaries, aux, failed
 
@@ -168,7 +230,7 @@ def _line(symbol, value, change=None):
 
 
 def cmd_portfolio(width=DEFAULT_WIDTH):
-    _, currency, summaries, aux, failed = _snapshot(width)
+    _, currency, summaries, aux, failed = _snapshot(width, sections=("history",))
     if not summaries:
         return "Could not load any holdings right now \u2014 try again shortly."
 
@@ -245,7 +307,7 @@ def _trend_line(aux, currency):
 
 
 def cmd_allocation(width=DEFAULT_WIDTH):
-    _, _, summaries, _, _ = _snapshot(width)
+    _, _, summaries, _, _ = _snapshot(width)  # summaries only
     positions = [s for s in summaries.values() if s.get("val_now")]
     if not positions:
         return "No holdings to break down."
@@ -279,7 +341,9 @@ def cmd_holding(symbol_arg, width=DEFAULT_WIDTH):
     if not symbol_arg:
         return "Usage: /holding &lt;TICKER&gt;   e.g. /holding MC.PA"
 
-    config, currency, summaries, aux, _ = _snapshot(width)
+    config, currency, summaries, aux, _ = _snapshot(
+        width, sections=("history", "analysts")
+    )
     wanted = symbol_arg.strip().upper()
     match = next((s for s in summaries.values() if s["symbol"].upper() == wanted), None)
     if match is None:
@@ -319,7 +383,7 @@ def cmd_holding(symbol_arg, width=DEFAULT_WIDTH):
 
 
 def cmd_dividends(width=DEFAULT_WIDTH):
-    _, currency, _, aux, _ = _snapshot(width)
+    _, currency, _, aux, _ = _snapshot(width, sections=("dividends",))
     dividends = list((aux.get("dividends") or {}).values())
     if not dividends:
         return "No dividend data for these holdings."
@@ -363,7 +427,7 @@ def cmd_dividends(width=DEFAULT_WIDTH):
 
 
 def cmd_news(limit=5):
-    _, _, _, aux, _ = _snapshot()
+    _, _, _, aux, _ = _snapshot(sections=("news",))
     items = (aux.get("news") or [])[:limit]
     if not items:
         return "No recent news for these holdings."
