@@ -62,10 +62,14 @@ job "stock-bot" {
         destination = "secrets/bot.env"
         env         = true
         change_mode = "restart"
+        # allowed_chat_ids is read with `index` so a missing key renders empty
+        # rather than failing the template. That is the first-run case: the bot
+        # comes up in setup mode, tells you your chat id, and serves no
+        # portfolio data until you add it here.
         data        = <<-EOT
           {{ with nomadVar "nomad/jobs/stock-bot" }}
           TELEGRAM_TOKEN={{ .telegram_token }}
-          TELEGRAM_ALLOWED_CHAT_IDS={{ .allowed_chat_ids }}
+          TELEGRAM_ALLOWED_CHAT_IDS={{ index . "allowed_chat_ids" }}
           {{ end }}
         EOT
       }
@@ -96,11 +100,12 @@ job "stock-bot" {
         data        = <<-EOT
           #!/bin/sh
           set -eu
-          # Reinstall on every start so a restart picks up a new release.
-          # Pinned to a tag: an unpinned main could restart into a broken bot
-          # unattended.
+          # Installed from the release tarball rather than git+https: the slim
+          # image has no git, and a tarball avoids installing one just to fetch
+          # a few files. Pinned to a tag so an unattended restart can't pull an
+          # untested main.
           pip install --no-cache-dir --quiet \
-            "git+https://github.com/artback/stock-change.git@v0.8.1"
+            "https://github.com/artback/stock-change/archive/refs/tags/v0.8.1.tar.gz"
           exec stock-price-bot
         EOT
       }
