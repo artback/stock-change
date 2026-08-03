@@ -61,6 +61,7 @@ HELP = """<b>Portfolio bot</b>
 /portfolio - value, day and month change
 /holding &lt;TICKER&gt; - one position in detail
 /dividends - upcoming payouts and 12m income
+/allocation - position weights and currency exposure
 /news - recent headlines
 /help - this message
 
@@ -138,82 +139,227 @@ def _snapshot(width=DEFAULT_WIDTH):
     return config, currency, summaries, aux, failed
 
 
-def cmd_portfolio(width=DEFAULT_WIDTH):
-    config, currency, summaries, aux, failed = _snapshot(width)
-    if not summaries:
-        return "Could not load any holdings right now — try again shortly."
+UP = "\U0001f7e2"
+DOWN = "\U0001f534"
+FLAT = "\u26aa"
 
-    total = sum(
-        s["val_now"] for s in summaries.values() if s.get("val_now") is not None
+
+def _money(value, symbol):
+    """Whole units: cents are noise on a phone."""
+    return f"{value:,.0f} {symbol}"
+
+
+def _dot(value):
+    return UP if value > 0 else DOWN if value < 0 else FLAT
+
+
+def _line(symbol, value, change=None):
+    """One holding as a chat line: marker, bold ticker, then the figures.
+
+    Deliberately not column-aligned — Telegram renders normal text in a
+    proportional font, so padding buys nothing and a monospace block to force
+    it reads like a terminal dump on a phone.
+    """
+    parts = [f"{_dot(change if change is not None else 0)} <b>{html.escape(symbol)}</b>"]
+    parts.append(html.escape(value))
+    if change is not None:
+        parts.append(f"{change:+.2f}%")
+    return " \u00b7 ".join(parts)
+
+
+def cmd_portfolio(width=DEFAULT_WIDTH):
+    _, currency, summaries, aux, failed = _snapshot(width)
+    if not summaries:
+        return "Could not load any holdings right now \u2014 try again shortly."
+
+    symbol = stock.CURRENCY_SYMBOLS.get(currency, currency)
+    positions = sorted(
+        (s for s in summaries.values() if s.get("val_now") is not None),
+        key=lambda s: s["val_now"],
+        reverse=True,
     )
+    total = sum(s["val_now"] for s in positions)
+    previous = sum(s.get("val_prev") or s["val_now"] for s in positions)
     if total:
         stock.record_portfolio_value(total, currency)
+    day_pct = ((total - previous) / previous * 100) if previous else 0.0
 
-    group = stock.build_display_group(
-        list(summaries.values()),
-        [],
-        currency,
-        history_points=aux.get("history", []),
-        monthly_changes=aux.get("monthly", {}),
-        error_symbols=failed,
-        holdings=config["holdings"],
-        analyst_results=aux.get("analysts", {}),
-        benchmark=aux.get("benchmark"),
-        portfolio_history=stock.load_portfolio_history(currency),
-        max_width=width,
-        # Only the table and the trend line belong on a phone.
-        max_height=200,
+    header = [
+        "\U0001f4ca <b>Portfolio</b>",
+        f"<b>{html.escape(_money(total, symbol))}</b>  {_dot(day_pct)} {day_pct:+.2f}% today",
+    ]
+
+    # Only holdings with a recorded cost basis can contribute here. Saying
+    # "all time" over a partial set would read as a whole-portfolio figure,
+    # so name the coverage whenever it isn't everything.
+    priced = [s for s in positions if s.get("cost_value")]
+    cost = sum(s["cost_value"] for s in priced)
+    if cost:
+        unrealized = sum(s.get("unrealized") or 0 for s in priced)
+        scope = (
+            "all time"
+            if len(priced) == len(positions)
+            else f"all time \u00b7 {len(priced)} of {len(positions)} holdings"
+        )
+        header.append(
+            f"{_dot(unrealized)} {html.escape(_money(unrealized, symbol))} "
+            f"({unrealized / cost * 100:+.2f}%) {scope}"
+        )
+
+    trend = _trend_line(aux, currency)
+    if trend:
+        header.append(trend)
+
+    # Biggest first: the top of the list is what actually gets read on a phone.
+    body = [
+        _line(s["symbol"], _money(s["val_now"], symbol), s.get("chg_pct"))
+        for s in positions
+    ]
+
+    parts = ["\n".join(header), "\n".join(body)]
+    if failed:
+        parts.append(f"\u26a0\ufe0f stale: {html.escape(', '.join(sorted(failed)))}")
+    return "\n\n".join(parts)
+
+
+def _trend_line(aux, currency):
+    """One line for the 30-day move, and the benchmark if one is configured."""
+    recorded = stock.load_portfolio_history(currency)
+    if len(recorded) >= stock.MIN_RECORDED_HISTORY_POINTS:
+        series, label = recorded, "30d"
+    else:
+        # Say what this actually is: today's basket priced backwards, not the
+        # portfolio's own history.
+        series, label = list(aux.get("history") or ()), "30d (basket)"
+    if len(series) < 2 or not series[0]:
+        return None
+    change = (series[-1] - series[0]) / series[0] * 100
+    line = f"\U0001f4c8 {label} {change:+.2f}%"
+    benchmark = aux.get("benchmark")
+    if benchmark and benchmark.get("change_pct") is not None:
+        line += (
+            f"  \u00b7  {html.escape(benchmark['symbol'])} "
+            f"{benchmark['change_pct']:+.2f}%"
+        )
+    return line
+
+
+def cmd_allocation(width=DEFAULT_WIDTH):
+    _, _, summaries, _, _ = _snapshot(width)
+    positions = [s for s in summaries.values() if s.get("val_now")]
+    if not positions:
+        return "No holdings to break down."
+    total = sum(s["val_now"] for s in positions)
+    positions.sort(key=lambda s: s["val_now"], reverse=True)
+
+    lines = []
+    for s in positions:
+        weight = s["val_now"] / total * 100
+        # A repeated block character keeps its width in a proportional font,
+        # so the bars still line up without a monospace block.
+        bar = "\u2588" * max(1, round(weight / 5))
+        lines.append(f"{bar} <b>{html.escape(s['symbol'])}</b> {weight:.1f}%")
+
+    by_currency = {}
+    for s in positions:
+        code = s.get("source_currency") or "?"
+        by_currency[code] = by_currency.get(code, 0) + s["val_now"]
+    exposure = "  ".join(
+        f"{html.escape(code)} {value / total * 100:.0f}%"
+        for code, value in sorted(by_currency.items(), key=lambda kv: -kv[1])
     )
-    return as_code_block(render(group, width))
+    return (
+        "\U0001f967 <b>Allocation</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\n\U0001f4b1 {exposure}"
+    )
 
 
-def cmd_holding(symbol, width=DEFAULT_WIDTH):
-    if not symbol:
+def cmd_holding(symbol_arg, width=DEFAULT_WIDTH):
+    if not symbol_arg:
         return "Usage: /holding &lt;TICKER&gt;   e.g. /holding MC.PA"
 
     config, currency, summaries, aux, _ = _snapshot(width)
-    wanted = symbol.strip().upper()
+    wanted = symbol_arg.strip().upper()
     match = next((s for s in summaries.values() if s["symbol"].upper() == wanted), None)
     if match is None:
         held = ", ".join(sorted(config["holdings"]))
-        return f"{html.escape(wanted)} is not in the portfolio.\nHoldings: {html.escape(held)}"
+        return (
+            f"{html.escape(wanted)} is not in the portfolio.\n\n"
+            f"Holdings: {html.escape(held)}"
+        )
 
-    lines = [f"<b>{html.escape(match['symbol'])}</b>"]
-    lines.append(f"Value    {match['val_now']:,.2f} {currency}")
-    lines.append(f"Quantity {match['qty']:,}")
-    lines.append(f"Day      {match['chg_pct']:+.2f}%")
+    symbol = stock.CURRENCY_SYMBOLS.get(currency, currency)
+    lines = [
+        f"{_dot(match.get('chg_pct') or 0)} <b>{html.escape(match['symbol'])}</b>",
+        "",
+        f"<b>{html.escape(_money(match['val_now'], symbol))}</b> "
+        f"\u00b7 {match['qty']:,} shares",
+        f"Today  {match['chg_pct']:+.2f}%",
+    ]
     month = (aux.get("monthly") or {}).get(match["symbol"])
     if month is not None:
-        lines.append(f"Month    {month:+.2f}%")
+        lines.append(f"Month  {month:+.2f}%")
     if match.get("return_pct") is not None:
         lines.append(
-            f"Return   {match['return_pct']:+.2f}%  "
-            f"({match['unrealized']:+,.2f} {currency})"
+            f"Return  {match['return_pct']:+.2f}% "
+            f"({html.escape(_money(match['unrealized'], symbol))})"
         )
     analysts = (aux.get("analysts") or {}).get(match["symbol"])
     if analysts:
-        consensus = analysts.get("consensus")
-        if consensus:
-            lines.append(f"Analysts {consensus} ({analysts.get('analyst_count', 0)})")
+        if analysts.get("consensus"):
+            lines.append(
+                f"\n\U0001f3af {html.escape(analysts['consensus'])} "
+                f"\u00b7 {analysts.get('analyst_count', 0)} analysts"
+            )
         upside = (analysts.get("price_target") or {}).get("upside_pct")
         if upside is not None:
-            lines.append(f"Target   {upside:+.1f}% to mean")
+            lines.append(f"Target {upside:+.1f}% from here")
     return "\n".join(lines)
 
 
 def cmd_dividends(width=DEFAULT_WIDTH):
-    config, currency, summaries, aux, _ = _snapshot(width)
+    _, currency, _, aux, _ = _snapshot(width)
     dividends = list((aux.get("dividends") or {}).values())
     if not dividends:
         return "No dividend data for these holdings."
-    group = stock.build_display_group(
-        list(summaries.values()), dividends, currency,
-        holdings=config["holdings"], max_width=width, max_height=200,
+
+    symbol = stock.CURRENCY_SYMBOLS.get(currency, currency)
+    parts = []
+
+    earning = sorted(
+        (d for d in dividends if d.get("ttm_total")),
+        key=lambda d: d["ttm_total"],
+        reverse=True,
     )
-    # The summary table is rendered too; keep only the dividends part.
-    text = render(group, width)
-    marker = text.find("Dividends")
-    return as_code_block(text[marker:] if marker != -1 else text)
+    if earning:
+        total = sum(d["ttm_total"] for d in earning)
+        parts.append(
+            "\U0001f4b0 <b>Dividends</b>\n"
+            f"<b>{html.escape(_money(total, symbol))}</b> over the last 12 months"
+        )
+        parts.append(
+            "\n".join(
+                f"\u00b7 <b>{html.escape(d['symbol'])}</b> "
+                f"{html.escape(_money(d['ttm_total'], symbol))} "
+                f"({(d.get('yield_pct') or 0):.2f}%)"
+                for d in earning
+            )
+        )
+
+    upcoming = sorted(
+        (d for d in dividends if d.get("ex_date")), key=lambda d: str(d["ex_date"])
+    )
+    if upcoming:
+        parts.append(
+            "\U0001f4c5 <b>Upcoming</b>\n"
+            + "\n".join(
+                f"\u00b7 <b>{html.escape(d['symbol'])}</b> {d['ex_date']} "
+                f"\u2192 {html.escape(_money(d['total_p'], symbol))}"
+                for d in upcoming
+            )
+        )
+    return "\n\n".join(parts) if parts else "No dividend data for these holdings."
 
 
 def cmd_news(limit=5):
@@ -221,14 +367,14 @@ def cmd_news(limit=5):
     items = (aux.get("news") or [])[:limit]
     if not items:
         return "No recent news for these holdings."
-    blocks = []
+    blocks = ["\U0001f4f0 <b>Latest news</b>"]
     for item in items:
         title = html.escape(item["title"])
         link = item.get("link")
         headline = f'<a href="{html.escape(link)}">{title}</a>' if link else title
         blocks.append(
-            f"<b>{html.escape(item['symbol'])}</b>  "
-            f"<i>{html.escape(item['pub_date'])}</i>\n{headline}"
+            f"<b>{html.escape(item['symbol'])}</b> "
+            f"\u00b7 <i>{html.escape(item['pub_date'])}</i>\n{headline}"
         )
     return "\n\n".join(blocks)
 
@@ -250,6 +396,8 @@ def handle_command(text, width=DEFAULT_WIDTH):
         return cmd_holding(args[0] if args else None, width)
     if command in ("/dividends", "/d"):
         return cmd_dividends(width)
+    if command in ("/allocation", "/a"):
+        return cmd_allocation(width)
     if command in ("/news", "/n"):
         return cmd_news()
     return None

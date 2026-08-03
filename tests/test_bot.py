@@ -167,15 +167,39 @@ class TestCommands:
     def test_portfolio(self, portfolio):
         out = _plain(stock_bot.handle_command("/portfolio"))
         assert "MC.PA" in out
-        assert "TOTAL" in out
+        assert "Portfolio" in out
 
-    def test_portfolio_fits_a_phone(self, portfolio):
+    def test_portfolio_reads_as_a_message_not_a_terminal(self, portfolio):
+        # Box drawing and monospace blocks look like a terminal dump on a
+        # phone; this is what the format was rewritten to avoid.
+        out = stock_bot.handle_command("/portfolio")
+        assert not set(out) & set("┏┓┗┛━┃│├┤┼╭╮╰╯"), "box drawing in a chat message"
+        assert "<pre>" not in out
+        assert "…" not in out
+
+    def test_portfolio_is_ordered_by_size(self, mocker, portfolio):
+        # The top of the list is what gets read on a phone. Names are chosen so
+        # size order and alphabetical order disagree — otherwise the assertion
+        # passes without the sort doing anything.
+        summaries = {
+            "AAA.ST": {
+                "symbol": "AAA.ST", "qty": 1, "val_now": 100.0, "val_prev": 100.0,
+                "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "EUR",
+                "conv": 1.0, "price": 100.0,
+            },
+            "ZZZ.ST": {
+                "symbol": "ZZZ.ST", "qty": 1, "val_now": 9000.0, "val_prev": 9000.0,
+                "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "EUR",
+                "conv": 1.0, "price": 9000.0,
+            },
+        }
+        mocker.patch("stock.fetch_summaries", return_value=(summaries, {}, []))
         out = _plain(stock_bot.handle_command("/portfolio"))
-        widest = max(len(line) for line in out.splitlines())
-        assert widest <= stock_bot.DEFAULT_WIDTH, widest
+        assert out.index("ZZZ.ST") < out.index("AAA.ST")
 
-    def test_portfolio_is_never_truncated(self, portfolio):
-        assert "…" not in _plain(stock_bot.handle_command("/portfolio"))
+    def test_direction_markers(self, portfolio):
+        out = _plain(stock_bot.handle_command("/portfolio"))
+        assert stock_bot.UP in out
 
     def test_portfolio_records_history(self, portfolio, mocker):
         record = mocker.patch("stock.record_portfolio_value")
@@ -184,12 +208,12 @@ class TestCommands:
 
     def test_holding(self, portfolio):
         out = _plain(stock_bot.handle_command("/holding MC.PA"))
-        assert "21,381.75" in out
+        assert "21,382" in out
         assert "+18.79%" in out
-        assert "Buy (25)" in out
+        assert "Buy" in out
 
     def test_holding_is_case_insensitive(self, portfolio):
-        assert "21,381.75" in _plain(stock_bot.handle_command("/holding mc.pa"))
+        assert "21,382" in _plain(stock_bot.handle_command("/holding mc.pa"))
 
     def test_holding_unknown_lists_what_is_held(self, portfolio):
         out = _plain(stock_bot.handle_command("/holding NOPE"))
@@ -202,7 +226,13 @@ class TestCommands:
     def test_dividends(self, portfolio):
         out = _plain(stock_bot.handle_command("/dividends"))
         assert "Dividends" in out
-        assert "585.00" in out
+        assert "585" in out
+
+    def test_allocation(self, portfolio):
+        out = _plain(stock_bot.handle_command("/allocation"))
+        assert "Allocation" in out
+        assert "MC.PA" in out
+        assert "%" in out
 
     def test_news(self, portfolio):
         out = stock_bot.handle_command("/news")
@@ -210,7 +240,7 @@ class TestCommands:
         assert "https://example.com/a" in out
 
     def test_short_aliases(self, portfolio):
-        for alias in ("/p", "/d", "/n"):
+        for alias in ("/p", "/d", "/n", "/a"):
             assert stock_bot.handle_command(alias) is not None
 
     def test_empty_message(self, portfolio):
@@ -289,3 +319,47 @@ class TestSetupMode:
         # Once configured, an unknown chat gets silence — not its own id back.
         assert stock_bot.process_update(self._update(999), "tok", {"42"}) is False
         assert sent == []
+
+
+class TestPartialCostBasis:
+    """P/L can only cover holdings that have a recorded cost basis.
+
+    Presenting it as a whole-portfolio figure would overstate it, exactly as
+    the dividends yield-on-cost total once did.
+    """
+
+    def test_coverage_is_named_when_partial(self, portfolio):
+        # The fixture prices MC.PA but not IUSA.DE.
+        out = _plain(stock_bot.handle_command("/portfolio"))
+        assert "1 of 2 holdings" in out
+
+    def test_no_qualifier_when_everything_is_priced(self, mocker, portfolio):
+        summaries = {
+            "MC.PA": {
+                "symbol": "MC.PA", "qty": 45, "val_now": 21381.75,
+                "val_prev": 21000.0, "chg_pct": 1.82, "daily_chg_val": 381.75,
+                "source_currency": "EUR", "conv": 1.0, "price": 475.15,
+                "cost": 400.0, "cost_value": 18000.0, "unrealized": 3381.75,
+                "return_pct": 18.79,
+            }
+        }
+        mocker.patch("stock.fetch_summaries", return_value=(summaries, {}, []))
+        out = _plain(stock_bot.handle_command("/portfolio"))
+        assert "all time" in out
+        assert "of 1 holdings" not in out
+
+    def test_percentage_uses_only_priced_holdings(self, portfolio):
+        # 3,381.75 on 18,000 is +18.79%; spreading it over the unpriced
+        # position too would report a much smaller number.
+        assert "+18.79%" in _plain(stock_bot.handle_command("/portfolio"))
+
+    def test_no_pl_line_without_any_cost_basis(self, mocker, portfolio):
+        summaries = {
+            "IUSA.DE": {
+                "symbol": "IUSA.DE", "qty": 720, "val_now": 46340.64,
+                "val_prev": 46000.0, "chg_pct": 0.74, "daily_chg_val": 340.64,
+                "source_currency": "EUR", "conv": 1.0, "price": 64.36,
+            }
+        }
+        mocker.patch("stock.fetch_summaries", return_value=(summaries, {}, []))
+        assert "all time" not in _plain(stock_bot.handle_command("/portfolio"))

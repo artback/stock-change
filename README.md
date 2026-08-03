@@ -242,9 +242,10 @@ stock-price-bot
 
 | Command | Shows |
 | --- | --- |
-| `/portfolio`, `/p` | Value, day and month change, rendered for a phone screen |
+| `/portfolio`, `/p` | Value, day change and P/L, biggest holding first |
 | `/holding <TICKER>`, `/h` | One position in detail |
 | `/dividends`, `/d` | Upcoming payouts and 12-month income |
+| `/allocation`, `/a` | Position weights and currency exposure |
 | `/news`, `/n` | Recent headlines |
 
 ### Finding your chat ID
