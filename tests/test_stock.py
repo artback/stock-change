@@ -13,7 +13,6 @@ from rich.table import Table
 import stock as stock_module
 from stock import (
     CURRENCY_SYMBOLS,
-    DEFAULT_CONFIG_PATH,
     DEFAULT_HOLDINGS,
     DEFAULT_SCHEDULE,
     EXCHANGE_SCHEDULES,
