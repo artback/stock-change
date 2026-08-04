@@ -594,41 +594,77 @@ def get_rate(source, target, cache):
             return None
 
 
+# A Friday close is three calendar days before a Monday. A wider gap means the
+# daily series is missing sessions, so its "previous" bar is not last session's
+# close and using it turns the daily change into a multi-day one.
+MAX_PREVIOUS_CLOSE_GAP_DAYS = 3
+
+
 def _previous_close_from_history(ticker):
-    """Fall back to daily history when fast_info lacks a previous close.
+    """Previous session's close from daily history, with its age in days.
 
     yfinance's fast_info intermittently returns NaN for
-    regularMarketPreviousClose (and previousClose) on some exchanges. Left
-    unhandled that forces the daily change to 0, hiding real up/down moves.
-    The prior session's close is the most recent daily bar before today, or
-    the last bar if today's hasn't appeared yet.
+    regularMarketPreviousClose on some exchanges. Left unhandled that forces
+    the daily change to 0, hiding real moves — but the daily series has gaps of
+    its own, so the caller needs to know how old this bar is before trusting it.
+
+    Returns ``(close, age_in_days)``, or ``(None, None)``.
     """
     try:
-        closes = ticker.history(period="5d")["Close"].dropna()
+        closes = ticker.history(period="7d")["Close"].dropna()
         if len(closes) < 1:
-            return None
+            return None, None
         last_bar = closes.index[-1]
         tz = getattr(last_bar, "tzinfo", None)
         today = (pd.Timestamp.now(tz=tz) if tz else pd.Timestamp.now()).date()
         if last_bar.date() == today:
-            return float(closes.iloc[-2]) if len(closes) >= 2 else None
-        return float(closes.iloc[-1])
+            if len(closes) < 2:
+                return None, None
+            bar = closes.index[-2]
+            return float(closes.iloc[-2]), (today - bar.date()).days
+        return float(closes.iloc[-1]), (today - last_bar.date()).days
     except Exception:
-        return None
+        return None, None
 
 
 def _cached_previous_close(symbol, ticker, cache):
-    """Previous-session close from daily history, cached per symbol.
+    """``(close, age_in_days)`` from daily history, cached per symbol.
 
     The prior session's close is stable for the whole trading day, so caching
     it avoids a redundant per-ticker history download on every watch refresh.
     """
     if cache is not None and symbol in cache:
         return cache[symbol]
-    value = _previous_close_from_history(ticker)
-    if cache is not None and value is not None:
-        cache[symbol] = value
-    return value
+    result = _previous_close_from_history(ticker)
+    if cache is not None and result[0] is not None:
+        cache[symbol] = result
+    return result
+
+
+def _resolve_previous_close(fast_info, price, symbol, ticker, cache):
+    """Pick the most trustworthy previous close among three unreliable sources.
+
+    ``regularMarketPreviousClose`` is authoritative when present. Otherwise the
+    daily history is preferred, but only when its latest bar really is the last
+    session — a gappy series silently yields a days-old close and turns "Day %"
+    into a multi-day change. ``previousClose`` fills that gap, except when it
+    mirrors the current price, which it intermittently does and which would
+    flatten the change to zero.
+    """
+    authoritative = fast_info.get("regularMarketPreviousClose")
+    if authoritative is not None and not pd.isna(authoritative):
+        return authoritative
+
+    from_history, age = _cached_previous_close(symbol, ticker, cache)
+    if from_history is not None and age is not None and age <= MAX_PREVIOUS_CLOSE_GAP_DAYS:
+        return from_history
+
+    reported = fast_info.get("previousClose")
+    if reported is not None and not pd.isna(reported) and reported != price:
+        return reported
+
+    # Both fallbacks are suspect; a stale close beats no change at all.
+    return from_history
 
 
 def get_ticker_summary(
@@ -647,11 +683,7 @@ def get_ticker_summary(
         # When it's missing, prefer daily history over fast_info's previousClose
         # — the latter is unreliable and sometimes mirrors today's lastPrice
         # (which would collapse the daily change to 0).
-        prev_close = fi.get("regularMarketPreviousClose")
-        if prev_close is None or pd.isna(prev_close):
-            prev_close = _cached_previous_close(symbol, t, prev_close_cache)
-        if prev_close is None or pd.isna(prev_close):
-            prev_close = fi.get("previousClose")
+        prev_close = _resolve_previous_close(fi, price, symbol, t, prev_close_cache)
         source_currency = fi.get("currency", "USD")
         conv = get_rate(source_currency, target_currency, rate_cache)
 

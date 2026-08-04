@@ -21,11 +21,13 @@ from stock import (
     KNOWN_CURRENCIES,
     MIN_RECORDED_HISTORY_POINTS,
     PRESERVES_COMMENTS,
+    _cached_previous_close,
     _consensus_trend,
     _fit_columns,
     _get_exchange_suffix,
     _has_market_activity,
     _json_safe,
+    _previous_close_from_history,
     _price_service_reachable,
     _retry,
     _score_ratings,
@@ -3149,3 +3151,123 @@ class TestOnCostColumnVisibility:
         )
         assert "On Cost" in out
         assert "4.00%" in out
+
+
+# ---------------------------------------------------------------------------
+# choosing a previous close
+# ---------------------------------------------------------------------------
+
+
+def _ticker_with_history(days_ago, close, fast_info, include_today=False):
+    """A ticker whose daily series has its latest bar `days_ago` days back."""
+    today = pd.Timestamp.now().normalize()
+    rows = [(today - pd.Timedelta(days=days_ago), close)]
+    if include_today:
+        rows.append((today, fast_info["lastPrice"]))
+    mock = MagicMock()
+    mock.fast_info = fast_info
+    mock.history.return_value = pd.DataFrame(
+        {"Close": [c for _, c in rows]}, index=pd.DatetimeIndex([d for d, _ in rows])
+    )
+    return mock
+
+
+class TestPreviousCloseSelection:
+    """Three unreliable sources; picking wrong turns Day % into a multi-day
+    change, which is exactly what made the reported percentages drift."""
+
+    def _fast_info(self, **overrides):
+        info = {
+            "lastPrice": 66.59,
+            "regularMarketPreviousClose": float("nan"),
+            "previousClose": 65.62,
+            "currency": "EUR",
+        }
+        info.update(overrides)
+        return info
+
+    def test_authoritative_value_wins(self, mocker):
+        ticker = _ticker_with_history(
+            1, 60.0, self._fast_info(regularMarketPreviousClose=65.0)
+        )
+        mocker.patch("yfinance.Ticker", return_value=ticker)
+        result = get_ticker_summary("IUSA.DE", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx((66.59 - 65.0) / 65.0 * 100)
+
+    def test_recent_history_bar_is_used(self, mocker):
+        ticker = _ticker_with_history(1, 64.0, self._fast_info())
+        mocker.patch("yfinance.Ticker", return_value=ticker)
+        result = get_ticker_summary("IUSA.DE", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx((66.59 - 64.0) / 64.0 * 100)
+
+    def test_friday_to_monday_gap_is_still_trusted(self, mocker):
+        ticker = _ticker_with_history(3, 64.0, self._fast_info())
+        mocker.patch("yfinance.Ticker", return_value=ticker)
+        result = get_ticker_summary("IUSA.DE", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx((66.59 - 64.0) / 64.0 * 100)
+
+    def test_gappy_history_falls_back_to_reported_close(self, mocker):
+        # The real failure: IUSA.DE's series jumped 07-31 -> 08-04, so the
+        # "previous" bar was four days old and Day % read +3.46% instead of
+        # +1.47%.
+        ticker = _ticker_with_history(4, 64.36, self._fast_info())
+        mocker.patch("yfinance.Ticker", return_value=ticker)
+        result = get_ticker_summary("IUSA.DE", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx((66.59 - 65.62) / 65.62 * 100)
+
+    def test_gappy_history_still_used_when_reported_close_mirrors_price(self, mocker):
+        # previousClose sometimes equals lastPrice, which would zero the change.
+        # A stale close beats reporting no move at all.
+        ticker = _ticker_with_history(4, 64.36, self._fast_info(previousClose=66.59))
+        mocker.patch("yfinance.Ticker", return_value=ticker)
+        result = get_ticker_summary("IUSA.DE", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx((66.59 - 64.36) / 64.36 * 100)
+
+    def test_todays_bar_is_skipped_when_present(self, mocker):
+        ticker = _ticker_with_history(1, 64.0, self._fast_info(), include_today=True)
+        mocker.patch("yfinance.Ticker", return_value=ticker)
+        result = get_ticker_summary("IUSA.DE", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx((66.59 - 64.0) / 64.0 * 100)
+
+    def test_no_usable_source_leaves_the_change_flat(self, mocker):
+        mock = MagicMock()
+        mock.fast_info = self._fast_info(previousClose=float("nan"))
+        mock.history.return_value = pd.DataFrame({"Close": []})
+        mocker.patch("yfinance.Ticker", return_value=mock)
+        result = get_ticker_summary("IUSA.DE", 1, "EUR", {})
+        assert result["chg_pct"] == 0
+
+
+class TestPreviousCloseFromHistory:
+    def test_reports_the_age_of_the_bar(self):
+        ticker = _ticker_with_history(
+            4, 64.36, {"lastPrice": 66.59}, include_today=False
+        )
+        close, age = _previous_close_from_history(ticker)
+        assert close == pytest.approx(64.36)
+        assert age == 4
+
+    def test_age_measured_from_the_bar_before_today(self):
+        ticker = _ticker_with_history(
+            2, 64.0, {"lastPrice": 66.59}, include_today=True
+        )
+        close, age = _previous_close_from_history(ticker)
+        assert close == pytest.approx(64.0)
+        assert age == 2
+
+    def test_empty_history(self):
+        mock = MagicMock()
+        mock.history.return_value = pd.DataFrame({"Close": []})
+        assert _previous_close_from_history(mock) == (None, None)
+
+    def test_failure_is_not_fatal(self):
+        mock = MagicMock()
+        mock.history.side_effect = RuntimeError("boom")
+        assert _previous_close_from_history(mock) == (None, None)
+
+    def test_cache_round_trips_the_pair(self):
+        ticker = _ticker_with_history(1, 64.0, {"lastPrice": 66.59})
+        cache = {}
+        first = _cached_previous_close("IUSA.DE", ticker, cache)
+        ticker.history.side_effect = AssertionError("should not refetch")
+        assert _cached_previous_close("IUSA.DE", ticker, cache) == first
