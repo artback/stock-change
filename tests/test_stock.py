@@ -1886,7 +1886,7 @@ class TestResolveConfigPath:
 
     def test_falls_back_to_default(self, monkeypatch):
         monkeypatch.delenv("STOCK_PRICE_CONFIG", raising=False)
-        assert resolve_config_path() == DEFAULT_CONFIG_PATH
+        assert resolve_config_path() == stock_module.DEFAULT_CONFIG_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -3395,3 +3395,32 @@ class TestDailyChangeIncludesFx:
         result = get_ticker_summary("SVOL-B.ST", 10, "EUR", {})
         assert result["val_prev"] == pytest.approx(100.0 * 0.11 * 10)
         assert result["val_now"] == pytest.approx(110.0 * 0.10 * 10)
+
+
+class TestUserFilesAreNeverTouched:
+    """A regression guard: the suite once wrote a test portfolio into the real
+    ~/.stock_price_history.json and wiped a genuine recorded history."""
+
+    def test_history_path_is_redirected(self, _isolate_user_files):
+        assert str(stock_module.HISTORY_PATH).startswith(str(_isolate_user_files))
+
+    def test_cache_path_is_redirected(self, _isolate_user_files):
+        assert str(stock_module.CACHE_PATH).startswith(str(_isolate_user_files))
+
+    def test_collect_portfolio_writes_only_inside_the_sandbox(
+        self, mocker, _isolate_user_files
+    ):
+        mocker.patch(
+            "stock.fetch_summaries",
+            return_value=(
+                {"AAPL": {"symbol": "AAPL", "qty": 1, "val_now": 1500.0,
+                          "val_prev": 1500.0, "chg_pct": 0.0, "daily_chg_val": 0.0,
+                          "source_currency": "USD", "conv": 1.0}},
+                {"AAPL": "USD"}, [],
+            ),
+        )
+        mocker.patch("stock.fetch_auxiliary", return_value={})
+        collect_portfolio({"AAPL": 1}, "USD")
+        written = {p.name for p in _isolate_user_files.iterdir()}
+        assert "history.json" in written
+        assert load_portfolio_history("USD") == [1500.0]

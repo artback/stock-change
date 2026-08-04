@@ -1061,7 +1061,7 @@ HISTORY_RETENTION_DAYS = 400
 MIN_RECORDED_HISTORY_POINTS = 5
 
 
-def record_portfolio_value(value, currency, path=HISTORY_PATH, today=None):
+def record_portfolio_value(value, currency, path=None, today=None):
     """Append today's portfolio value to the on-disk history. Best-effort.
 
     One entry per day, last write of the day winning. Switching target
@@ -1070,6 +1070,7 @@ def record_portfolio_value(value, currency, path=HISTORY_PATH, today=None):
     """
     if value is None or pd.isna(value) or value <= 0:
         return None
+    path = path or HISTORY_PATH
     try:
         day = str(today or datetime.now().date())
         data = {}
@@ -1093,10 +1094,10 @@ def record_portfolio_value(value, currency, path=HISTORY_PATH, today=None):
         return None
 
 
-def load_portfolio_history(currency, path=HISTORY_PATH, days=30):
+def load_portfolio_history(currency, path=None, days=30):
     """Recorded portfolio values for the last ``days``, oldest first."""
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path or HISTORY_PATH).read_text())
     except Exception:
         return []
     if data.get("currency") != currency:
@@ -1513,7 +1514,7 @@ def _cache_key(holdings, currency):
     return f"{currency}:" + ",".join(f"{k}={v}" for k, v in sorted(holdings.items()))
 
 
-def load_cached_portfolio(holdings, currency, ttl, path=CACHE_PATH):
+def load_cached_portfolio(holdings, currency, ttl, path=None):
     """Return a fresh cached snapshot for this portfolio, or None.
 
     Used to make repeated one-shot invocations instant. Disabled when
@@ -1523,7 +1524,7 @@ def load_cached_portfolio(holdings, currency, ttl, path=CACHE_PATH):
     if ttl <= 0:
         return None
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path or CACHE_PATH).read_text())
     except Exception:
         return None
     if data.get("key") != _cache_key(holdings, currency):
@@ -1537,9 +1538,10 @@ def load_cached_portfolio(holdings, currency, ttl, path=CACHE_PATH):
 
 def save_cached_portfolio(
     holdings, currency, summaries, dividends, news, history_points, monthly_changes,
-    path=CACHE_PATH, analysts=None, benchmark=None,
+    path=None, analysts=None, benchmark=None,
 ):
     """Persist a portfolio snapshot for fast repeated runs. Best-effort."""
+    path = path or CACHE_PATH
     try:
         payload = {
             "key": _cache_key(holdings, currency),
@@ -1741,16 +1743,18 @@ def collect_portfolio(
     *,
     cache_ttl=0,
     want_analysts=True,
-    cache_path=CACHE_PATH,
+    cache_path=None,
     cost_basis=None,
     benchmark=None,
-    history_path=HISTORY_PATH,
+    history_path=None,
 ):
     """Fetch a full portfolio snapshot and return it as a JSON-ready payload.
 
     The quiet counterpart to the live TUI loop — it renders nothing, so stdout
     stays clean for ``--json`` consumers.
     """
+    cache_path = cache_path or CACHE_PATH
+    history_path = history_path or HISTORY_PATH
     cached = load_cached_portfolio(
         holdings, target_currency, cache_ttl, path=cache_path
     )
