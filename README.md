@@ -80,10 +80,15 @@ leaves the average untouched. `set_holding` replaces it outright, since that
 means "this is the position".
 
 `cost` is per share in the **ticker's own currency**, the way a contract note
-reads. Returns are therefore computed in that currency and exclude any FX
-movement since you bought: converting a historical cost at today's rate would
-quietly fold currency drift into what looks like a stock return. The P/L
-*amount* is converted to your target currency for display.
+reads. Long-run returns are therefore computed in that currency and exclude FX
+movement since you bought: without the purchase-date exchange rate, converting
+a historical cost at today's rate would fold years of currency drift into what
+looks like a stock return. The P/L *amount* is converted for display.
+
+The **daily** change is different — both sides of it are datable, so it is
+computed in your target currency with the currency move included. A SEK holding
+that rose 0.2% on a day the krona fell 0.6% against the euro shows as a loss for
+a euro-reporting portfolio, because that is what happened to its value.
 
 ## Usage
 

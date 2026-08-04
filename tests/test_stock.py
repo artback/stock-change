@@ -48,6 +48,7 @@ from stock import (
     get_analyst_data,
     get_dividend_data,
     get_news_data,
+    get_previous_rate,
     get_rate,
     get_ticker_summary,
     holding_cost,
@@ -3271,3 +3272,126 @@ class TestPreviousCloseFromHistory:
         first = _cached_previous_close("IUSA.DE", ticker, cache)
         ticker.history.side_effect = AssertionError("should not refetch")
         assert _cached_previous_close("IUSA.DE", ticker, cache) == first
+
+
+# ---------------------------------------------------------------------------
+# FX in the daily change
+# ---------------------------------------------------------------------------
+
+
+class TestPreviousRate:
+    def test_same_currency_needs_no_lookup(self, mocker):
+        ticker = mocker.patch("stock.yf.Ticker")
+        assert get_previous_rate("EUR", "EUR", {}) == 1.0
+        ticker.assert_not_called()
+
+    def test_direct_pair(self, mocker):
+        mocker.patch(
+            "stock._previous_close_from_history", return_value=(0.0911, 1)
+        )
+        assert get_previous_rate("SEK", "EUR", {}) == pytest.approx(0.0911)
+
+    def test_inverse_pair_is_inverted(self, mocker):
+        # SEKEUR=X missing, EURSEK=X present.
+        results = iter([(None, None), (11.0, 1)])
+        mocker.patch(
+            "stock._previous_close_from_history", side_effect=lambda t: next(results)
+        )
+        assert get_previous_rate("SEK", "EUR", {}) == pytest.approx(1 / 11.0)
+
+    def test_stale_fx_history_is_rejected(self, mocker):
+        # Same reasoning as prices: a days-old rate is not yesterday's rate.
+        mocker.patch("stock._previous_close_from_history", return_value=(0.0911, 9))
+        assert get_previous_rate("SEK", "EUR", {}) is None
+
+    def test_result_is_cached(self, mocker):
+        history = mocker.patch(
+            "stock._previous_close_from_history", return_value=(0.0911, 1)
+        )
+        cache = {}
+        get_previous_rate("SEK", "EUR", cache)
+        get_previous_rate("SEK", "EUR", cache)
+        assert history.call_count == 1
+
+    def test_failure_is_cached_too(self, mocker):
+        # Otherwise every ticker in the currency retries the same dead lookup.
+        history = mocker.patch(
+            "stock._previous_close_from_history", return_value=(None, None)
+        )
+        cache = {}
+        assert get_previous_rate("SEK", "EUR", cache) is None
+        get_previous_rate("SEK", "EUR", cache)
+        assert history.call_count == 2  # one per pair orientation, then cached
+
+    def test_does_not_collide_with_current_rate_cache(self, mocker):
+        mocker.patch("stock._previous_close_from_history", return_value=(0.0911, 1))
+        cache = {"SEKEUR=X": 0.0906}
+        assert get_previous_rate("SEK", "EUR", cache) == pytest.approx(0.0911)
+        assert cache["SEKEUR=X"] == 0.0906
+
+
+class TestDailyChangeIncludesFx:
+    """A EUR holder of a SEK share gains or loses on the currency too; the
+    daily change has to be the move they actually experienced."""
+
+    def _ticker(self, mocker, price=110.0, prev=100.0):
+        mock = MagicMock()
+        mock.fast_info = {
+            "lastPrice": price,
+            "regularMarketPreviousClose": prev,
+            "currency": "SEK",
+        }
+        mocker.patch("yfinance.Ticker", return_value=mock)
+        return mock
+
+    def test_currency_move_is_included(self, mocker):
+        self._ticker(mocker)
+        mocker.patch("stock.get_rate", return_value=0.10)
+        mocker.patch("stock.get_previous_rate", return_value=0.11)
+        result = get_ticker_summary("SVOL-B.ST", 1, "EUR", {})
+        # 110 * 0.10 = 11.00 today against 100 * 0.11 = 11.00 yesterday: the
+        # share rose 10% but the currency gave it all back.
+        assert result["chg_pct"] == pytest.approx(0.0)
+
+    def test_a_gain_can_become_a_loss(self, mocker):
+        # The real case: LIFCO-B.ST rose 0.18% in SEK on a day SEK fell 0.55%
+        # against EUR, so a EUR holder was down 0.39%.
+        self._ticker(mocker, price=100.18, prev=100.0)
+        mocker.patch("stock.get_rate", return_value=0.0906)
+        mocker.patch("stock.get_previous_rate", return_value=0.0911)
+        result = get_ticker_summary("LIFCO-B.ST", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx(-0.37, abs=0.05)
+
+    def test_a_small_fx_move_does_not_flip_a_bigger_gain(self, mocker):
+        self._ticker(mocker, price=101.0, prev=100.0)
+        mocker.patch("stock.get_rate", return_value=0.0906)
+        mocker.patch("stock.get_previous_rate", return_value=0.0911)
+        result = get_ticker_summary("INVE-B.ST", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx(0.45, abs=0.05)
+
+    def test_same_currency_is_unaffected(self, mocker):
+        mock = MagicMock()
+        mock.fast_info = {
+            "lastPrice": 110.0,
+            "regularMarketPreviousClose": 100.0,
+            "currency": "EUR",
+        }
+        mocker.patch("yfinance.Ticker", return_value=mock)
+        result = get_ticker_summary("MC.PA", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx(10.0)
+
+    def test_missing_previous_rate_falls_back_to_today(self, mocker):
+        # Degrades to the old FX-neutral behaviour rather than losing the row.
+        self._ticker(mocker)
+        mocker.patch("stock.get_rate", return_value=0.10)
+        mocker.patch("stock.get_previous_rate", return_value=None)
+        result = get_ticker_summary("SVOL-B.ST", 1, "EUR", {})
+        assert result["chg_pct"] == pytest.approx(10.0)
+
+    def test_previous_value_uses_the_previous_rate(self, mocker):
+        self._ticker(mocker)
+        mocker.patch("stock.get_rate", return_value=0.10)
+        mocker.patch("stock.get_previous_rate", return_value=0.11)
+        result = get_ticker_summary("SVOL-B.ST", 10, "EUR", {})
+        assert result["val_prev"] == pytest.approx(100.0 * 0.11 * 10)
+        assert result["val_now"] == pytest.approx(110.0 * 0.10 * 10)

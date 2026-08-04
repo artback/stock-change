@@ -641,6 +641,40 @@ def _cached_previous_close(symbol, ticker, cache):
     return result
 
 
+def get_previous_rate(source, target, cache):
+    """The exchange rate at the previous session's close.
+
+    Converting both today's price and yesterday's close at *today's* rate
+    cancels the currency out, so the daily change reports the move in the
+    stock's own currency rather than the one the portfolio is reported in. For
+    a EUR portfolio holding SEK shares those are different numbers.
+
+    Falls back to ``None`` so the caller can use the current rate: an FX
+    lookup failing should cost accuracy, not the whole row.
+    """
+    if source == target:
+        return 1.0
+    key = f"prev:{source}{target}=X"
+    if key in cache:
+        return cache[key]
+
+    rate = None
+    for pair, invert in ((f"{source}{target}=X", False), (f"{target}{source}=X", True)):
+        try:
+            close, age = _previous_close_from_history(yf.Ticker(pair))
+        except Exception:
+            continue
+        if close is None or age is None or age > MAX_PREVIOUS_CLOSE_GAP_DAYS:
+            continue
+        if not close:
+            continue
+        rate = (1 / close) if invert else close
+        break
+
+    cache[key] = rate
+    return rate
+
+
 def _resolve_previous_close(fast_info, price, symbol, ticker, cache):
     """Pick the most trustworthy previous close among three unreliable sources.
 
@@ -688,10 +722,18 @@ def get_ticker_summary(
         conv = get_rate(source_currency, target_currency, rate_cache)
 
         if price is not None and not pd.isna(price) and conv is not None and not pd.isna(conv):
+            # Yesterday's value is converted at yesterday's rate, so the daily
+            # change is the move an owner reporting in target_currency actually
+            # saw — currency included. Falling back to today's rate just makes
+            # this holding FX-neutral rather than dropping it.
+            conv_prev = get_previous_rate(source_currency, target_currency, rate_cache)
+            if conv_prev is None or pd.isna(conv_prev):
+                conv_prev = conv
+
             val_now = (price * conv) * qty
             if prev_close and not pd.isna(prev_close):
-                val_prev = (prev_close * conv) * qty
-                chg_pct = ((price - prev_close) / prev_close) * 100
+                val_prev = (prev_close * conv_prev) * qty
+                chg_pct = ((val_now - val_prev) / val_prev) * 100 if val_prev else 0
             else:
                 val_prev = val_now
                 chg_pct = 0
