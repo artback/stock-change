@@ -8,7 +8,7 @@ import os
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -594,10 +594,18 @@ def get_rate(source, target, cache):
             return None
 
 
-# A Friday close is three calendar days before a Monday. A wider gap means the
-# daily series is missing sessions, so its "previous" bar is not last session's
-# close and using it turns the daily change into a multi-day one.
-MAX_PREVIOUS_CLOSE_GAP_DAYS = 3
+def previous_business_day(today):
+    """The weekday before ``today``, skipping the weekend.
+
+    Counting calendar days is not enough: a Monday bar is only two days before
+    a Wednesday, yet it skips Tuesday's session entirely. yfinance's daily
+    series drops recent sessions often enough that this has to be checked by
+    date rather than by distance.
+    """
+    day = today - timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
 
 
 def _previous_close_from_history(ticker):
@@ -608,7 +616,7 @@ def _previous_close_from_history(ticker):
     the daily change to 0, hiding real moves — but the daily series has gaps of
     its own, so the caller needs to know how old this bar is before trusting it.
 
-    Returns ``(close, age_in_days)``, or ``(None, None)``.
+    Returns ``(close, bar_date)``, or ``(None, None)``.
     """
     try:
         closes = ticker.history(period="7d")["Close"].dropna()
@@ -620,15 +628,14 @@ def _previous_close_from_history(ticker):
         if last_bar.date() == today:
             if len(closes) < 2:
                 return None, None
-            bar = closes.index[-2]
-            return float(closes.iloc[-2]), (today - bar.date()).days
-        return float(closes.iloc[-1]), (today - last_bar.date()).days
+            return float(closes.iloc[-2]), closes.index[-2].date()
+        return float(closes.iloc[-1]), last_bar.date()
     except Exception:
         return None, None
 
 
 def _cached_previous_close(symbol, ticker, cache):
-    """``(close, age_in_days)`` from daily history, cached per symbol.
+    """``(close, bar_date)`` from daily history, cached per symbol.
 
     The prior session's close is stable for the whole trading day, so caching
     it avoids a redundant per-ticker history download on every watch refresh.
@@ -659,12 +666,13 @@ def get_previous_rate(source, target, cache):
         return cache[key]
 
     rate = None
+    cutoff = previous_business_day(datetime.now().date())
     for pair, invert in ((f"{source}{target}=X", False), (f"{target}{source}=X", True)):
         try:
-            close, age = _previous_close_from_history(yf.Ticker(pair))
+            close, bar_date = _previous_close_from_history(yf.Ticker(pair))
         except Exception:
             continue
-        if close is None or age is None or age > MAX_PREVIOUS_CLOSE_GAP_DAYS:
+        if close is None or bar_date is None or bar_date < cutoff:
             continue
         if not close:
             continue
@@ -679,9 +687,10 @@ def _resolve_previous_close(fast_info, price, symbol, ticker, cache):
     """Pick the most trustworthy previous close among three unreliable sources.
 
     ``regularMarketPreviousClose`` is authoritative when present. Otherwise the
-    daily history is preferred, but only when its latest bar really is the last
-    session — a gappy series silently yields a days-old close and turns "Day %"
-    into a multi-day change. ``previousClose`` fills that gap, except when it
+    daily history is preferred, but only when its latest bar is dated the
+    previous business day — the series regularly drops a recent session, and a
+    bar from before it turns "Day %" into a multi-day change. ``previousClose``
+    fills that gap and is usually right when history is short, except when it
     mirrors the current price, which it intermittently does and which would
     flatten the change to zero.
     """
@@ -689,8 +698,12 @@ def _resolve_previous_close(fast_info, price, symbol, ticker, cache):
     if authoritative is not None and not pd.isna(authoritative):
         return authoritative
 
-    from_history, age = _cached_previous_close(symbol, ticker, cache)
-    if from_history is not None and age is not None and age <= MAX_PREVIOUS_CLOSE_GAP_DAYS:
+    from_history, bar_date = _cached_previous_close(symbol, ticker, cache)
+    if (
+        from_history is not None
+        and bar_date is not None
+        and bar_date >= previous_business_day(datetime.now().date())
+    ):
         return from_history
 
     reported = fast_info.get("previousClose")
