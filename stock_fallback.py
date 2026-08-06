@@ -83,9 +83,18 @@ def to_provider_symbol(yahoo_symbol):
     return symbol[:dot], mic
 
 
+# Frankfurter rejects urllib's default agent with a 403. Identifying the client
+# is the polite fix and the one that works; it was invisible locally because
+# the first check was made with curl.
+USER_AGENT = "stock-price (+https://github.com/artback/stock-change)"
+
+
 def _get_json(url, params, timeout=TIMEOUT):
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-    with urllib.request.urlopen(f"{url}?{query}", timeout=timeout) as response:
+    request = urllib.request.Request(
+        f"{url}?{query}", headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode())
 
 

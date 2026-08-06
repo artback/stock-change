@@ -175,3 +175,52 @@ class TestApiKey:
 
     def test_unset(self):
         assert stock_fallback.api_key() is None
+
+
+class TestRequestHeaders:
+    """Frankfurter answers urllib's default agent with a 403, which only
+    showed up once the code ran somewhere other than a laptop."""
+
+    def test_requests_identify_the_client(self, mocker):
+        opened = {}
+
+        class FakeResponse:
+            def read(self):
+                return b'{"rates": {"EUR": 0.09}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            opened["headers"] = request.headers
+            return FakeResponse()
+
+        mocker.patch("stock_fallback.urllib.request.urlopen", fake_urlopen)
+        stock_fallback.fetch_rate("SEK", "EUR")
+        headers = {k.lower(): v for k, v in opened["headers"].items()}
+        assert "stock-price" in headers["User-agent".lower()]
+
+    def test_query_omits_unset_parameters(self, mocker):
+        # A None mic_code must not become the literal string "None".
+        captured = {}
+
+        class FakeResponse:
+            def read(self):
+                return b'{"close": "1.0", "currency": "USD"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            return FakeResponse()
+
+        mocker.patch("stock_fallback.urllib.request.urlopen", fake_urlopen)
+        stock_fallback.fetch_quote("AAPL", key="k")
+        assert "mic_code" not in captured["url"]

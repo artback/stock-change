@@ -70,6 +70,7 @@ job "stock-bot" {
           {{ with nomadVar "nomad/jobs/stock-bot" }}
           TELEGRAM_TOKEN={{ .telegram_token }}
           TELEGRAM_ALLOWED_CHAT_IDS={{ index . "allowed_chat_ids" }}
+          TWELVEDATA_API_KEY={{ index . "twelvedata_api_key" }}
           {{ end }}
         EOT
       }
