@@ -139,6 +139,7 @@ def _config():
 # Which auxiliary sections each command needs, and how long each stays fresh.
 _AUX_TTL = {
     "history": HISTORY_TTL,
+    "quote_age": SUMMARY_TTL,
     "dividends": SLOW_TTL,
     "news": SLOW_TTL,
     "analysts": SLOW_TTL,
@@ -181,6 +182,7 @@ def _snapshot(width=DEFAULT_WIDTH, *, sections=()):
             want_dividends="dividends" in stale,
             want_news="news" in stale,
             want_analysts="analysts" in stale,
+            want_quote_age="quote_age" in stale,
             benchmark=config.get("benchmark"),
         )
         now = time.monotonic()
@@ -191,6 +193,7 @@ def _snapshot(width=DEFAULT_WIDTH, *, sections=()):
             "dividends": ("dividends",),
             "news": ("news",),
             "analysts": ("analysts",),
+            "quote_age": ("quote_age",),
         }
         for name in stale:
             section = {k: fresh[k] for k in groups[name] if k in fresh}
@@ -240,7 +243,9 @@ def _line(symbol, value, change=None):
 
 
 def cmd_portfolio(width=DEFAULT_WIDTH):
-    _, currency, summaries, aux, failed = _snapshot(width, sections=("history",))
+    config, currency, summaries, aux, failed = _snapshot(
+        width, sections=("history", "quote_age")
+    )
     if not summaries:
         return "Could not load any holdings right now \u2014 try again shortly."
 
@@ -281,6 +286,12 @@ def cmd_portfolio(width=DEFAULT_WIDTH):
     trend = _trend_line(aux, currency)
     if trend:
         header.append(trend)
+
+    # Without this a frozen upstream feed is indistinguishable from a flat
+    # market — the numbers just stop moving with no explanation.
+    stale = stock.stale_quote_note(aux.get("quote_age"), config["holdings"])
+    if stale:
+        header.append(html.escape(stale))
 
     # Biggest first: the top of the list is what actually gets read on a phone.
     body = [

@@ -1040,6 +1040,59 @@ def fetch_all_analysts(summary_values):
     return results
 
 
+# During a session, intraday bars appear every five minutes. Well past that
+# and the feed has stopped moving — which looks exactly like a quiet market
+# unless the tool says so.
+STALE_QUOTE_MINUTES = 20
+
+# Enough symbols to tell "this ticker is broken" from "the feed is down",
+# without paying for a request per holding.
+QUOTE_AGE_SAMPLE = 3
+
+
+def _last_bar_age_minutes(symbol):
+    """Minutes since the most recent intraday bar, or None."""
+    try:
+        bars = yf.Ticker(symbol).history(period="1d", interval="5m")["Close"].dropna()
+        if bars.empty:
+            return None
+        last = bars.index[-1]
+        now = pd.Timestamp.now(tz=getattr(last, "tzinfo", None))
+        return max(0.0, (now - last).total_seconds() / 60)
+    except Exception:
+        return None
+
+
+def quote_age_minutes(symbols):
+    """How old the freshest quote in the portfolio is, in minutes.
+
+    fast_info carries no timestamp, so the tool otherwise cannot tell a live
+    price from one frozen hours ago and shows both identically. Sampling a few
+    symbols and taking the freshest avoids blaming the feed for one bad ticker.
+    """
+    symbols = list(symbols)[:QUOTE_AGE_SAMPLE]
+    if not symbols:
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(symbols)) as pool:
+        ages = [a for a in pool.map(_last_bar_age_minutes, symbols) if a is not None]
+    return min(ages) if ages else None
+
+
+def stale_quote_note(age_minutes, holdings, now=None):
+    """A warning when quotes have stopped moving during a session.
+
+    Silent outside market hours: prices are *supposed* to be still then, and
+    crying stale every evening would train the warning to be ignored.
+    """
+    if age_minutes is None or age_minutes < STALE_QUOTE_MINUTES:
+        return None
+    if not is_any_market_open(holdings, now):
+        return None
+    if age_minutes >= 120:
+        return f"⚠ prices last moved {age_minutes / 60:.1f}h ago (upstream feed)"
+    return f"⚠ prices last moved {age_minutes:.0f} min ago (upstream feed)"
+
+
 def fetch_benchmark(symbol, period="1mo"):
     """Index performance over the same window as the portfolio trend.
 
@@ -1446,6 +1499,7 @@ def fetch_auxiliary(
     want_dividends=False,
     want_news=False,
     want_analysts=False,
+    want_quote_age=False,
     benchmark=None,
 ):
     """Refresh whichever of the auxiliary sections are requested, concurrently.
@@ -1456,7 +1510,7 @@ def fetch_auxiliary(
     running them together avoids serialising independent network round-trips.
     """
     result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         hist_future = (
             pool.submit(fetch_history, holdings, target_currency, ticker_to_currency)
             if want_history
@@ -1475,6 +1529,11 @@ def fetch_auxiliary(
         analyst_future = (
             pool.submit(fetch_all_analysts, list(summaries.values()))
             if want_analysts
+            else None
+        )
+        age_future = (
+            pool.submit(quote_age_minutes, list(summaries.keys()))
+            if want_quote_age
             else None
         )
         # The benchmark rides along with history: they cover the same window
@@ -1496,6 +1555,8 @@ def fetch_auxiliary(
             result["analysts"] = analyst_future.result()
         if benchmark_future is not None:
             result["benchmark"] = benchmark_future.result()
+        if age_future is not None:
+            result["quote_age"] = age_future.result()
     return result
 
 
@@ -2000,6 +2061,7 @@ def build_display_group(
     portfolio_history=None,
     max_width=None,
     max_height=None,
+    stale_note=None,
 ):
     target_symbol = CURRENCY_SYMBOLS.get(target_currency, target_currency)
     monthly_changes = monthly_changes or {}
@@ -2381,8 +2443,12 @@ def build_display_group(
 
     # 5. Footer
     footer = Text(footer_text, style="dim italic") if footer_text else Text("")
-    if dropped_columns:
+    if stale_note:
         if footer_text:
+            footer.append(" | ", style="dim")
+        footer.append(stale_note, style="yellow")
+    if dropped_columns:
+        if footer_text or stale_note:
             footer.append(" | ", style="dim")
         if len(dropped_columns) > 3:
             note = f"narrow terminal — {len(dropped_columns)} columns hidden"
@@ -2541,6 +2607,7 @@ def fetch_portfolio():
         news_cache = []
         analyst_cache = {}
         benchmark_data = None
+        stale_note = None
         portfolio_history = load_portfolio_history(target_currency)
         history_points = []
         monthly_changes = {}
@@ -2660,6 +2727,7 @@ def fetch_portfolio():
                             and not args.no_analysts
                             and (now - last_analyst_update > 600 or not analyst_cache)
                         ),
+                        want_quote_age=bool(summary_cache),
                         benchmark=benchmark_symbol,
                     )
                     if "history" in aux:
@@ -2676,6 +2744,8 @@ def fetch_portfolio():
                     if "news" in aux:
                         news_cache = aux["news"]
                         last_news_update = now
+                    if "quote_age" in aux:
+                        stale_note = stale_quote_note(aux["quote_age"], holdings)
                     if aux.get("benchmark"):
                         benchmark_data = aux["benchmark"]
                     if "analysts" in aux:
@@ -2745,6 +2815,7 @@ def fetch_portfolio():
                             analyst_results=analyst_cache,
                             benchmark=benchmark_data,
                             portfolio_history=portfolio_history,
+                            stale_note=stale_note,
                         )
                     )
 
@@ -2793,6 +2864,7 @@ def fetch_portfolio():
                     analyst_results=analyst_cache,
                     benchmark=benchmark_data,
                     portfolio_history=portfolio_history,
+                    stale_note=stale_note,
                 )
             )
 

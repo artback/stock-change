@@ -20,12 +20,15 @@ from stock import (
     KNOWN_CURRENCIES,
     MIN_RECORDED_HISTORY_POINTS,
     PRESERVES_COMMENTS,
+    QUOTE_AGE_SAMPLE,
+    STALE_QUOTE_MINUTES,
     _cached_previous_close,
     _consensus_trend,
     _fit_columns,
     _get_exchange_suffix,
     _has_market_activity,
     _json_safe,
+    _last_bar_age_minutes,
     _previous_close_from_history,
     _price_service_reachable,
     _retry,
@@ -59,6 +62,7 @@ from stock import (
     parse_holdings,
     portfolio_payload,
     previous_business_day,
+    quote_age_minutes,
     read_config_document,
     record_portfolio_value,
     remove_holding,
@@ -67,6 +71,7 @@ from stock import (
     resolve_symbol,
     save_cached_portfolio,
     set_holding,
+    stale_quote_note,
     validate_currency,
     write_config_document,
 )
@@ -3446,3 +3451,102 @@ class TestUserFilesAreNeverTouched:
         written = {p.name for p in _isolate_user_files.iterdir()}
         assert "history.json" in written
         assert load_portfolio_history("USD") == [1500.0]
+
+
+# ---------------------------------------------------------------------------
+# stale quote detection
+# ---------------------------------------------------------------------------
+
+
+class TestStaleQuoteNote:
+    """fast_info carries no timestamp, so without this the app shows a price
+    frozen hours ago exactly as it shows a live one."""
+
+    OPEN = datetime(2026, 8, 6, 10, 0, tzinfo=ZoneInfo("Europe/Stockholm"))
+    CLOSED = datetime(2026, 8, 6, 22, 0, tzinfo=ZoneInfo("Europe/Stockholm"))
+
+    def test_warns_when_the_feed_stops_during_a_session(self):
+        note = stale_quote_note(183.0, {"MC.PA": 1}, now=self.OPEN)
+        assert note is not None
+        assert "3.0h" in note
+
+    def test_minutes_below_two_hours(self):
+        note = stale_quote_note(45.0, {"MC.PA": 1}, now=self.OPEN)
+        assert "45 min" in note
+
+    def test_silent_for_a_fresh_quote(self):
+        assert stale_quote_note(5.0, {"MC.PA": 1}, now=self.OPEN) is None
+
+    def test_silent_outside_market_hours(self):
+        # Prices are supposed to be still overnight; warning every evening
+        # would train the warning to be ignored.
+        assert stale_quote_note(600.0, {"MC.PA": 1}, now=self.CLOSED) is None
+
+    def test_silent_when_age_is_unknown(self):
+        assert stale_quote_note(None, {"MC.PA": 1}, now=self.OPEN) is None
+
+    @pytest.mark.parametrize("age", [19.9, 20.0])
+    def test_threshold(self, age):
+        note = stale_quote_note(age, {"MC.PA": 1}, now=self.OPEN)
+        assert (note is None) == (age < STALE_QUOTE_MINUTES)
+
+
+class TestQuoteAge:
+    def test_reports_the_freshest_of_the_sample(self, mocker):
+        # One dead ticker shouldn't be reported as the whole feed being down.
+        mocker.patch(
+            "stock._last_bar_age_minutes", side_effect=[300.0, 4.0, 250.0]
+        )
+        assert quote_age_minutes(["A", "B", "C"]) == pytest.approx(4.0)
+
+    def test_samples_a_few_symbols_not_all(self, mocker):
+        age = mocker.patch("stock._last_bar_age_minutes", return_value=5.0)
+        quote_age_minutes([f"S{i}" for i in range(20)])
+        assert age.call_count == QUOTE_AGE_SAMPLE
+
+    def test_no_symbols(self):
+        assert quote_age_minutes([]) is None
+
+    def test_all_lookups_failing(self, mocker):
+        mocker.patch("stock._last_bar_age_minutes", return_value=None)
+        assert quote_age_minutes(["A"]) is None
+
+    def test_bar_age_handles_an_empty_series(self, mocker):
+        mock = MagicMock()
+        mock.history.return_value = pd.DataFrame({"Close": []})
+        mocker.patch("stock.yf.Ticker", return_value=mock)
+        assert _last_bar_age_minutes("A") is None
+
+    def test_bar_age_failure_is_not_fatal(self, mocker):
+        mocker.patch("stock.yf.Ticker", side_effect=RuntimeError("boom"))
+        assert _last_bar_age_minutes("A") is None
+
+
+class TestStaleNoteInTheTable:
+    def _summary(self):
+        return {
+            "symbol": "MC.PA", "qty": 1, "val_now": 100.0, "val_prev": 100.0,
+            "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "EUR",
+        }
+
+    def test_note_is_shown(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "EUR", stale_note="⚠ prices last moved 3.0h ago"
+            )
+        )
+        assert "prices last moved" in out
+
+    def test_note_joins_existing_footer_text(self):
+        out = _render(
+            build_display_group(
+                [self._summary()], [], "EUR", "Last update: 12:00:00",
+                stale_note="⚠ stale",
+            )
+        )
+        assert "Last update: 12:00:00" in out
+        assert "stale" in out
+
+    def test_absent_when_fresh(self):
+        out = _render(build_display_group([self._summary()], [], "EUR"))
+        assert "prices last moved" not in out
