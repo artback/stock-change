@@ -2582,7 +2582,8 @@ def check_fallback(holdings):
         return 1
 
     console.print("Checking the backup provider for each holding…\n")
-    quotes = stock_fallback.fetch_quotes(holdings)
+    errors = {}
+    quotes = stock_fallback.fetch_quotes(holdings, errors=errors)
     missing = []
     for symbol in sorted(holdings):
         quote = quotes.get(symbol)
@@ -2595,7 +2596,11 @@ def check_fallback(holdings):
             )
         else:
             missing.append(symbol)
-            console.print(f"  [red]fail[/red] {symbol:<12} → {mapped} @ {venue}")
+            reason = errors.get(symbol, "no quote returned")
+            console.print(
+                f"  [red]fail[/red] {symbol:<12} → {mapped} @ {venue}  "
+                f"[dim]{reason}[/dim]"
+            )
 
     if missing:
         console.print(

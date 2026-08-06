@@ -17,7 +17,6 @@ Everything here returns empty rather than raising. A fallback that breaks the
 run is worse than the outage it exists to paper over.
 """
 
-import concurrent.futures
 import json
 import os
 import urllib.error
@@ -53,10 +52,10 @@ YAHOO_SUFFIX_TO_MIC = {
     ".AX": "XASX",
 }
 
-# The free tier allows eight requests a minute, which a portfolio of eight
-# holdings would consume exactly. Quotes are only fetched when the primary
-# feed has already stalled, so a small pool keeps a burst inside the limit.
-MAX_CONCURRENCY = 4
+# Free tiers meter by the minute, and a portfolio can exceed the whole budget
+# in one burst — eight concurrent requests self-429 before any of them lands.
+# Quotes are therefore batched by venue: one request per exchange, not per
+# holding, which for a typical portfolio is three instead of eight.
 TIMEOUT = 10
 
 
@@ -118,6 +117,11 @@ def fetch_quote(yahoo_symbol, key=None, timeout=TIMEOUT):
         return None
 
     # Errors arrive as a normal 200 with a status field.
+    return _parse_quote(yahoo_symbol, payload)
+
+
+def _parse_quote(yahoo_symbol, payload):
+    """Turn one provider quote into the shape the primary path produces."""
     if not isinstance(payload, dict) or payload.get("status") == "error":
         return None
     try:
@@ -128,7 +132,6 @@ def fetch_quote(yahoo_symbol, key=None, timeout=TIMEOUT):
         previous_close = float(payload.get("previous_close"))
     except (TypeError, ValueError):
         previous_close = None
-
     return {
         "symbol": str(yahoo_symbol).strip().upper(),
         "price": price,
@@ -138,30 +141,70 @@ def fetch_quote(yahoo_symbol, key=None, timeout=TIMEOUT):
     }
 
 
-def fetch_quotes(yahoo_symbols, key=None, timeout=TIMEOUT):
+def fetch_quotes(yahoo_symbols, key=None, timeout=TIMEOUT, errors=None):
     """Quotes for several tickers, keyed by their Yahoo symbol.
 
-    Symbols the provider cannot serve are simply absent, so the caller keeps
-    whatever the primary feed gave it for those.
+    One request per venue rather than per holding, so a portfolio cannot spend
+    a whole minute's rate-limit budget in a single burst. Symbols the provider
+    will not serve are simply absent and the caller keeps the primary feed's
+    value; pass ``errors`` to also collect why, which is what turns a bare
+    "fail" into something actionable.
     """
     symbols = list(yahoo_symbols)
     key = key or api_key()
     if not symbols or not key:
         return {}
+
+    by_venue = {}
+    for yahoo_symbol in symbols:
+        provider_symbol, mic = to_provider_symbol(yahoo_symbol)
+        by_venue.setdefault(mic, []).append((yahoo_symbol, provider_symbol))
+
     quotes = {}
-    workers = min(MAX_CONCURRENCY, len(symbols))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(fetch_quote, s, key, timeout): s for s in symbols
+    for mic, pairs in by_venue.items():
+        params = {
+            "symbol": ",".join(provider for _, provider in pairs),
+            "mic_code": mic,
+            "apikey": key,
         }
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                quote = future.result()
-            except Exception:
-                quote = None
+        try:
+            payload = _get_json(TWELVEDATA_QUOTE, params, timeout=timeout)
+        except Exception as exc:
+            reason = _describe(exc)
+            if errors is not None:
+                for yahoo_symbol, _ in pairs:
+                    errors[yahoo_symbol] = reason
+            continue
+
+        # A single symbol comes back bare; several come back keyed by symbol.
+        for yahoo_symbol, provider_symbol in pairs:
+            entry = payload if len(pairs) == 1 else payload.get(provider_symbol)
+            quote = _parse_quote(yahoo_symbol, entry)
             if quote:
-                quotes[futures[future]] = quote
+                quotes[yahoo_symbol] = quote
+            elif errors is not None:
+                errors[yahoo_symbol] = _describe_payload(entry)
     return quotes
+
+
+def _describe(exc):
+    """A short, actionable reason a venue's request failed."""
+    code = getattr(exc, "code", None)
+    if code == 429:
+        return "rate limited (free tiers meter per minute)"
+    if code == 404:
+        return "not covered by this plan"
+    if code in (401, 403):
+        return "rejected — check the API key"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _describe_payload(entry):
+    if not isinstance(entry, dict):
+        return "no data returned"
+    if entry.get("status") == "error":
+        return str(entry.get("message") or "provider error")[:90]
+    return "no price in the response"
 
 
 def fetch_rate(source, target, timeout=TIMEOUT):
