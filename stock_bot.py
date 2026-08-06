@@ -200,6 +200,16 @@ def _snapshot(width=DEFAULT_WIDTH, *, sections=()):
             _cache[f"aux:{name}"] = (now, section)
             aux.update(section)
 
+    # A stalled primary feed is exactly when the backup earns its keep.
+    if summaries and (aux.get("quote_age") is not None or failed):
+        note = stock.stale_quote_note(aux.get("quote_age"), config["holdings"])
+        if note or failed:
+            swapped = stock.apply_fallback_quotes(
+                summaries, currency, {}, failed
+            )
+            if swapped:
+                aux["fallback_used"] = swapped
+
     stock.apply_holiday_zeroing(summaries, aux.get("traded"))
     return config, currency, summaries, aux, failed
 
@@ -289,9 +299,16 @@ def cmd_portfolio(width=DEFAULT_WIDTH):
 
     # Without this a frozen upstream feed is indistinguishable from a flat
     # market — the numbers just stop moving with no explanation.
-    stale = stock.stale_quote_note(aux.get("quote_age"), config["holdings"])
-    if stale:
-        header.append(html.escape(stale))
+    swapped = aux.get("fallback_used")
+    if swapped:
+        header.append(
+            f"↻ {len(swapped)} quote(s) via backup provider "
+            "(primary feed stalled)"
+        )
+    else:
+        stale = stock.stale_quote_note(aux.get("quote_age"), config["holdings"])
+        if stale:
+            header.append(html.escape(stale))
 
     # Biggest first: the top of the list is what actually gets read on a phone.
     body = [

@@ -234,6 +234,36 @@ records the purchase price as well as the share count.
 versus "I bought 5 more" — so it's worth confirming the numbers your assistant
 read back to you.
 
+## Backup price provider
+
+Yahoo's finance endpoints are undocumented and unsupported, and they do stall —
+on 2026-08-06 every European exchange froze for hours while other providers kept
+publishing. A second source keeps the portfolio honest through that.
+
+**Exchange rates** fall back to [Frankfurter](https://frankfurter.dev) (European
+Central Bank reference rates) automatically. No key, no setup.
+
+**Quotes** fall back to [Twelve Data](https://twelvedata.com/pricing), which
+needs a free API key:
+
+```bash
+export TWELVEDATA_API_KEY="your-key"
+```
+
+The backup is only consulted when the primary feed has stalled or a ticker
+failed outright, so a working Yahoo is never second-guessed. When it is used,
+the CLI footer and the bot say so rather than quietly swapping sources.
+
+Providers name venues differently — Yahoo's `MC.PA` is `MC` on `XPAR` — so check
+your own holdings resolve before relying on it:
+
+```bash
+stock-price --check-fallback
+```
+
+Anything the backup cannot price simply keeps the primary feed's last value
+during an outage, flagged as stale.
+
 ## Telegram bot
 
 Check the portfolio from your phone. The bot is read-only — it reports, and

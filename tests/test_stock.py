@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 import stock as stock_module
+import stock_fallback  # noqa: F401
 from stock import (
     CURRENCY_SYMBOLS,
     DEFAULT_HOLDINGS,
@@ -36,6 +37,7 @@ from stock import (
     _table_width,
     add_shares,
     analyst_view,
+    apply_fallback_quotes,
     apply_holiday_zeroing,
     blend_cost,
     build_display_group,
@@ -3550,3 +3552,119 @@ class TestStaleNoteInTheTable:
     def test_absent_when_fresh(self):
         out = _render(build_display_group([self._summary()], [], "EUR"))
         assert "prices last moved" not in out
+
+
+# ---------------------------------------------------------------------------
+# swapping in the backup provider
+# ---------------------------------------------------------------------------
+
+
+class TestApplyFallbackQuotes:
+    """The backup only replaces what the primary could not serve fresh; a
+    working Yahoo is never second-guessed."""
+
+    def _summaries(self, **overrides):
+        summary = {
+            "symbol": "MC.PA", "qty": 10, "val_now": 4856.0, "val_prev": 4869.0,
+            "chg_pct": -0.27, "daily_chg_val": -13.0, "source_currency": "EUR",
+            "conv": 1.0, "price": 485.6,
+        }
+        summary.update(overrides)
+        return {"MC.PA": summary}
+
+    def _quote(self, **overrides):
+        quote = {
+            "symbol": "MC.PA", "price": 490.0, "previous_close": 486.9,
+            "currency": "EUR", "provider": "twelvedata",
+        }
+        quote.update(overrides)
+        return {"MC.PA": quote}
+
+    def test_replaces_price_and_recomputes_the_change(self, mocker):
+        mocker.patch("stock_fallback.fetch_quotes", return_value=self._quote())
+        summaries = self._summaries()
+        swapped = apply_fallback_quotes(summaries, "EUR", {})
+        assert swapped == ["MC.PA"]
+        assert summaries["MC.PA"]["price"] == pytest.approx(490.0)
+        assert summaries["MC.PA"]["val_now"] == pytest.approx(4900.0)
+        assert summaries["MC.PA"]["chg_pct"] == pytest.approx(
+            (490.0 - 486.9) / 486.9 * 100
+        )
+
+    def test_records_where_the_quote_came_from(self, mocker):
+        mocker.patch("stock_fallback.fetch_quotes", return_value=self._quote())
+        summaries = self._summaries()
+        apply_fallback_quotes(summaries, "EUR", {})
+        assert summaries["MC.PA"]["quote_source"] == "twelvedata"
+
+    def test_recomputes_cost_basis_figures(self, mocker):
+        mocker.patch("stock_fallback.fetch_quotes", return_value=self._quote())
+        summaries = self._summaries(cost=400.0, cost_value=4000.0)
+        apply_fallback_quotes(summaries, "EUR", {})
+        assert summaries["MC.PA"]["return_pct"] == pytest.approx(22.5)
+        assert summaries["MC.PA"]["unrealized"] == pytest.approx(900.0)
+
+    def test_converts_a_foreign_currency_quote(self, mocker):
+        mocker.patch(
+            "stock_fallback.fetch_quotes",
+            return_value=self._quote(currency="SEK", price=100.0,
+                                     previous_close=100.0),
+        )
+        mocker.patch("stock.get_rate", return_value=0.09)
+        mocker.patch("stock.get_previous_rate", return_value=0.09)
+        summaries = self._summaries()
+        apply_fallback_quotes(summaries, "EUR", {})
+        assert summaries["MC.PA"]["val_now"] == pytest.approx(100.0 * 0.09 * 10)
+
+    def test_nothing_to_swap(self, mocker):
+        mocker.patch("stock_fallback.fetch_quotes", return_value={})
+        summaries = self._summaries()
+        before = dict(summaries["MC.PA"])
+        assert apply_fallback_quotes(summaries, "EUR", {}) == []
+        assert summaries["MC.PA"] == before
+
+    def test_a_quote_for_an_unheld_symbol_is_ignored(self, mocker):
+        mocker.patch(
+            "stock_fallback.fetch_quotes",
+            return_value={"ZZZZ": {"price": 1.0, "currency": "EUR"}},
+        )
+        summaries = self._summaries()
+        assert apply_fallback_quotes(summaries, "EUR", {}) == []
+
+    def test_unconvertible_currency_leaves_the_holding_alone(self, mocker):
+        mocker.patch(
+            "stock_fallback.fetch_quotes",
+            return_value=self._quote(currency="XYZ"),
+        )
+        mocker.patch("stock.get_rate", return_value=None)
+        summaries = self._summaries()
+        before = dict(summaries["MC.PA"])
+        assert apply_fallback_quotes(summaries, "EUR", {}) == []
+        assert summaries["MC.PA"] == before
+
+    def test_failed_symbols_are_requested_too(self, mocker):
+        fetch = mocker.patch("stock_fallback.fetch_quotes", return_value={})
+        apply_fallback_quotes(self._summaries(), "EUR", {}, failed=["GONE.ST"])
+        assert "GONE.ST" in fetch.call_args[0][0]
+
+
+class TestFxFallback:
+    def test_frankfurter_covers_a_pair_yahoo_cannot(self, mocker):
+        mocker.patch("stock.yf.Ticker", side_effect=RuntimeError("down"))
+        rate = mocker.patch("stock_fallback.fetch_rate", return_value=0.09121)
+        cache = {}
+        assert get_rate("SEK", "EUR", cache) == pytest.approx(0.09121)
+        rate.assert_called_once()
+
+    def test_the_fallback_rate_is_cached(self, mocker):
+        mocker.patch("stock.yf.Ticker", side_effect=RuntimeError("down"))
+        rate = mocker.patch("stock_fallback.fetch_rate", return_value=0.09121)
+        cache = {}
+        get_rate("SEK", "EUR", cache)
+        get_rate("SEK", "EUR", cache)
+        rate.assert_called_once()
+
+    def test_still_none_when_both_sources_fail(self, mocker):
+        mocker.patch("stock.yf.Ticker", side_effect=RuntimeError("down"))
+        mocker.patch("stock_fallback.fetch_rate", return_value=None)
+        assert get_rate("SEK", "EUR", {}) is None

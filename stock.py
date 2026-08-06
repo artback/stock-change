@@ -21,6 +21,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import stock_fallback
+
 try:
     import select as select_mod
     import termios
@@ -591,7 +593,12 @@ def get_rate(source, target, cache):
             cache[pair] = rate
             return rate
         except Exception:
-            return None
+            # Both Yahoo pairs failed. Frankfurter needs no key, so this half
+            # of the fallback is always available.
+            rate = stock_fallback.fetch_rate(source, target)
+            if rate is not None:
+                cache[pair] = rate
+            return rate
 
 
 def previous_business_day(today):
@@ -1427,6 +1434,55 @@ def fetch_history(holdings, target_currency, ticker_to_currency):
         return history_totals, monthly_changes, traded_today
     except Exception:
         return [], {}, set()
+
+
+def apply_fallback_quotes(summaries, target_currency, rate_cache, failed=()):
+    """Replace stalled or missing quotes with a second provider's.
+
+    Only touches holdings the primary feed could not serve fresh, so a working
+    Yahoo is never second-guessed. Returns the symbols that were replaced.
+    """
+    wanted = [s for s in summaries] + [s for s in failed if s not in summaries]
+    quotes = stock_fallback.fetch_quotes(wanted)
+    if not quotes:
+        return []
+
+    replaced = []
+    for symbol, quote in quotes.items():
+        summary = summaries.get(symbol)
+        if summary is None:
+            continue
+        currency = quote.get("currency") or summary["source_currency"]
+        conv = get_rate(currency, target_currency, rate_cache)
+        if conv is None or pd.isna(conv):
+            continue
+        price = quote["price"]
+        previous = quote.get("previous_close") or summary.get("price")
+        conv_prev = get_previous_rate(currency, target_currency, rate_cache)
+        if conv_prev is None or pd.isna(conv_prev):
+            conv_prev = conv
+
+        qty = summary["qty"]
+        summary["price"] = price
+        summary["source_currency"] = currency
+        summary["conv"] = conv
+        summary["val_now"] = (price * conv) * qty
+        if previous:
+            summary["val_prev"] = (previous * conv_prev) * qty
+            summary["chg_pct"] = (
+                ((summary["val_now"] - summary["val_prev"]) / summary["val_prev"]) * 100
+                if summary["val_prev"]
+                else 0
+            )
+        summary["daily_chg_val"] = summary["val_now"] - summary["val_prev"]
+        cost = summary.get("cost")
+        if cost:
+            summary["cost_value"] = (cost * conv) * qty
+            summary["unrealized"] = ((price - cost) * conv) * qty
+            summary["return_pct"] = ((price - cost) / cost) * 100
+        summary["quote_source"] = quote.get("provider")
+        replaced.append(symbol)
+    return replaced
 
 
 def fetch_summaries(
@@ -2509,6 +2565,48 @@ def build_display_group(
     return Group(*elements)
 
 
+def check_fallback(holdings):
+    """Report whether the backup provider can price each holding.
+
+    The provider names venues differently from Yahoo, and the mapping cannot
+    be verified without a key. This turns that unknown into one command.
+    Returns a process exit code.
+    """
+    if not stock_fallback.api_key():
+        err_console.print(
+            f"[yellow]No backup provider configured.[/yellow] Set "
+            f"[bold]{stock_fallback.API_KEY_ENV}[/bold] to a free key from "
+            "https://twelvedata.com/pricing — exchange rates already fall back "
+            "to Frankfurter, which needs no key."
+        )
+        return 1
+
+    console.print("Checking the backup provider for each holding…\n")
+    quotes = stock_fallback.fetch_quotes(holdings)
+    missing = []
+    for symbol in sorted(holdings):
+        quote = quotes.get(symbol)
+        mapped, mic = stock_fallback.to_provider_symbol(symbol)
+        venue = mic or "US"
+        if quote:
+            console.print(
+                f"  [green]ok[/green]   {symbol:<12} → {mapped} @ {venue}  "
+                f"{quote['price']:.2f} {quote.get('currency') or ''}"
+            )
+        else:
+            missing.append(symbol)
+            console.print(f"  [red]fail[/red] {symbol:<12} → {mapped} @ {venue}")
+
+    if missing:
+        console.print(
+            f"\n[yellow]{len(missing)} holding(s) the backup cannot price.[/yellow] "
+            "Those keep the primary feed's last value during an outage."
+        )
+        return 1
+    console.print("\n[green]All holdings can be priced by the backup.[/green]")
+    return 0
+
+
 def fetch_portfolio():
     parser = argparse.ArgumentParser(description="Track stock prices and dividends")
     parser.add_argument(
@@ -2533,6 +2631,11 @@ def fetch_portfolio():
         "--json",
         action="store_true",
         help="Print the portfolio as JSON on stdout instead of rendering a table",
+    )
+    parser.add_argument(
+        "--check-fallback",
+        action="store_true",
+        help="Verify the backup price provider can serve your holdings, then exit",
     )
     parser.add_argument(
         "--benchmark",
@@ -2566,6 +2669,9 @@ def fetch_portfolio():
                 f"[bold red]ERROR:[/bold red] '{target_currency}' is not a valid ISO currency code."
             )
             sys.exit(1)
+
+        if args.check_fallback:
+            sys.exit(check_fallback(holdings))
 
         if args.json:
             payload = collect_portfolio(
@@ -2746,6 +2852,18 @@ def fetch_portfolio():
                         last_news_update = now
                     if "quote_age" in aux:
                         stale_note = stale_quote_note(aux["quote_age"], holdings)
+                        if stale_note or failed_symbols:
+                            swapped = apply_fallback_quotes(
+                                summary_cache,
+                                target_currency,
+                                rate_cache,
+                                failed_symbols,
+                            )
+                            if swapped:
+                                stale_note = (
+                                    f"↻ {len(swapped)} quote(s) from the backup "
+                                    "provider — the primary feed had stalled"
+                                )
                     if aux.get("benchmark"):
                         benchmark_data = aux["benchmark"]
                     if "analysts" in aux:

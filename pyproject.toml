@@ -72,7 +72,7 @@ show_missing = true
 fail_under = 60
 
 [tool.setuptools]
-py-modules = ["stock", "stock_mcp", "stock_bot"]
+py-modules = ["stock", "stock_mcp", "stock_bot", "stock_fallback"]
 
 [tool.setuptools.dynamic]
 version = {file = "VERSION"}
