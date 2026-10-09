@@ -20,6 +20,10 @@ command menu in the chat header — a different UX. What the bot needs is an
 `editMessageText`) are stable since the original Bot API and are received via
 the existing `getUpdates` long-poll with no extra registration.
 
+(Shipped as v0.11.0. The field report that followed — a duplicate message per
+re-tap, and the missing header button other bots have — is resolved in
+v0.11.1; see **Follow-up** below.)
+
 ### The menu
 
 `menu_keyboard()` returns the standard markup — one button per section,
@@ -114,3 +118,57 @@ and the JSON of hundreds of buttons is wasted payload on a phone).
   holding, in-place edit + fallback, stranger/setup silence, ack behaviour,
   unknown data, failing-section reply.
 - `README.md` — Telegram bot section: the menu, and that commands still work.
+
+## Follow-up (v0.11.1): sticky no-op + bar menu button
+
+Field report after the v0.11.0 homelab deploy: (1) re-tapping the section the
+sticky menu already shows stacked a *new* message per tap, and (2) the chat
+header had no menu button of its own, unlike other bots.
+
+### Bug: "message is not modified" became a duplicate message
+
+Telegram rejects an `editMessageText` whose text *and* markup are unchanged
+with `400 Bad Request: message is not modified` (reproduced live against the
+running bot on 2026-10-09). Re-tapping the section the sticky menu already
+shows is exactly that — normal use, not a failure. The v0.11.0 fallback
+treated *every* edit exception as "edit failed, send a fresh message", so
+each no-op tap stacked a duplicate; the warning was also logged without the
+API error, which made the cause invisible.
+
+Fix in `process_callback`: an edit rejected as `message is not modified` is a
+no-op — the requested reply is already on screen, so nothing is sent and only
+the ack stops the spinner. Any *other* edit failure still falls back to a
+fresh message, now logged **with** the API error.
+
+### Feature: the bar menu button
+
+The per-chat Menu Button and the command dropdown are opt-in on
+Telegram's side; v0.11.0 registered neither, so the header showed only the
+bare default ("Start"). Two calls change that:
+
+- `setMyCommands` — once at startup (`main`). Registers
+  `start / portfolio / holding / dividends / allocation / news / help` with
+  descriptions mirroring `HELP`, so the dropdown the header button opens
+  lists exactly what `handle_command` handles and can't drift from it.
+- `setChatMenuButton(chat_id, {"type": "commands"})` — once per chat per
+  process (`_menu_button_chats`), from the command path for allowlisted
+  chats, after the reply has been sent. Turns the header's default button
+  into the command-menu dropdown.
+
+Both are cosmetic: a `setMyCommands` failure at startup logs a warning and
+the menu stays at Telegram's default; a `setChatMenuButton` failure logs and
+retries on the next command — neither ever breaks a reply. Setup mode and
+strangers never get the button. (The button only appears in private chats —
+a Telegram limitation, which is this bot's use case.)
+
+### Contract changes (v0.11.1)
+
+- `process_callback` — `message is not modified` edits are no-ops (ack
+  only); other edit failures log the API error.
+- New: `set_my_commands`, `set_chat_menu_button`, `_ensure_menu_button`,
+  module-level `_menu_button_chats`.
+- `main()` — registers the command list once before polling.
+- `process_update` — installs the chat's header button once, after a
+  successful command reply.
+- `tests/test_bot.py` — no-op re-tap, command-list registration, once-per-
+  chat install, stranger/setup silence, install-failure safety.

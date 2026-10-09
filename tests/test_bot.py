@@ -22,9 +22,15 @@ def _plain(text):
 @pytest.fixture(autouse=True)
 def _clear_cache():
     """The bot caches between commands; tests must not inherit each other's."""
-    stock_bot._cache.clear()
+    for name in ("_cache", "_menu_button_chats"):
+        state = getattr(stock_bot, name, None)
+        if state is not None:
+            state.clear()
     yield
-    stock_bot._cache.clear()
+    for name in ("_cache", "_menu_button_chats"):
+        state = getattr(stock_bot, name, None)
+        if state is not None:
+            state.clear()
 
 
 @pytest.fixture
@@ -508,6 +514,32 @@ class TestMenuButtons:
         assert self._callback_data(send[1].get("reply_markup")) == self.MENU_DATA
         self._ack(calls)
 
+    def test_repressing_the_shown_section_sends_no_duplicate(self, mocker, portfolio):
+        # Telegram rejects an edit that changes nothing ("message is not
+        # modified"). Re-tapping the section the sticky menu already shows
+        # must not stack a duplicate message — the reply is on screen, so
+        # only the ack may follow.
+        calls = []
+
+        def fake(token, method, params=None, timeout=None):
+            calls.append((method, params or {}))
+            if method == "editMessageText":
+                raise RuntimeError(
+                    "editMessageText failed: Bad Request: message is not "
+                    "modified: specified new message content and reply "
+                    "markup are exactly the same as a current content and "
+                    "reply markup of the message"
+                )
+            return []
+
+        mocker.patch("stock_bot._request", side_effect=fake)
+        assert stock_bot.process_update(self._callback(), "tok", {"42"}) is True
+        methods = [m for m, _ in calls]
+        assert methods.count("editMessageText") == 1
+        assert "sendMessage" not in methods
+        # The press is still acknowledged so the button's spinner stops.
+        assert methods.count("answerCallbackQuery") == 1
+
     def test_stranger_callback_gets_only_an_ack(self, sent, portfolio):
         # In a group chat the buttons are visible to every member; the silence
         # rule from the text path must hold for taps too.
@@ -535,6 +567,105 @@ class TestMenuButtons:
             is False
         )
         assert [m for m, _ in sent] == ["answerCallbackQuery"]
+
+
+class TestBarMenuButton:
+    """The menu button in the chat header (the "bar"), like other bots have.
+
+    Telegram's command dropdown and per-chat Menu Button are opt-in: a bot
+    that never calls setMyCommands/setChatMenuButton shows only the bare
+    default "Start". The bot registers its command list once at startup and
+    installs the commands-type menu button for each allowlisted chat once
+    per process. Both are cosmetic — a failure degrades to Telegram's
+    defaults and never breaks a reply.
+    """
+
+    EXPECTED_COMMANDS = {
+        "start",
+        "portfolio",
+        "holding",
+        "dividends",
+        "allocation",
+        "news",
+        "help",
+    }
+
+    def _update(self, chat_id, text="/start"):
+        return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
+
+    def test_set_my_commands_registers_every_handled_command(self, sent):
+        stock_bot.set_my_commands("tok")
+        method, params = sent[0]
+        assert method == "setMyCommands"
+        commands = json.loads(params["commands"])
+        # The dropdown lists exactly what handle_command answers.
+        assert {c["command"] for c in commands} == self.EXPECTED_COMMANDS
+        # A dropdown entry without a description is useless.
+        assert all(c["description"] for c in commands)
+
+    def test_startup_registers_the_command_list(self, mocker, monkeypatch):
+        calls = []
+
+        def fake(token, method, params=None, timeout=None):
+            calls.append(method)
+            if method == "getUpdates":
+                raise KeyboardInterrupt
+            return []
+
+        monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
+        mocker.patch("stock_bot._request", side_effect=fake)
+        stock_bot.main()
+        # The list is registered before polling begins.
+        assert calls[0] == "setMyCommands"
+
+    def test_command_reply_installs_the_bar_button(self, sent, portfolio):
+        assert stock_bot.process_update(self._update(42), "tok", {"42"}) is True
+        install = next(c for c in sent if c[0] == "setChatMenuButton")
+        assert install[1]["chat_id"] in (42, "42")
+        assert json.loads(install[1]["button"]) == {"type": "commands"}
+        # The reply itself still goes out, still carrying the inline menu.
+        reply = next(c for c in sent if c[0] == "sendMessage")
+        assert reply[1].get("reply_markup")
+
+    def test_bar_button_is_installed_once_per_chat(self, sent, portfolio):
+        # Telegram keeps the button until it is changed; one call is enough.
+        for _ in range(3):
+            stock_bot.process_update(self._update(42), "tok", {"42"})
+        assert [m for m, _ in sent].count("setChatMenuButton") == 1
+
+    def test_strangers_never_get_the_bar_button(self, sent, portfolio):
+        assert stock_bot.process_update(self._update(999), "tok", {"42"}) is False
+        assert "setChatMenuButton" not in [m for m, _ in sent]
+
+    def test_setup_mode_never_gets_the_bar_button(self, sent, portfolio):
+        stock_bot.process_update(self._update(42), "tok", set())
+        assert "setChatMenuButton" not in [m for m, _ in sent]
+
+    def test_unknown_command_does_not_install_the_bar_button(self, sent, portfolio):
+        # Only a command the bot actually answers gets the button.
+        assert (
+            stock_bot.process_update(self._update(42, "/nope"), "tok", {"42"}) is False
+        )
+        assert "setChatMenuButton" not in [m for m, _ in sent]
+
+    def test_button_install_failure_keeps_the_reply(self, mocker, portfolio):
+        # A setChatMenuButton hiccup is cosmetic; the command reply must
+        # still land.
+        calls = []
+
+        def fake(token, method, params=None, timeout=None):
+            calls.append((method, params or {}))
+            if method == "setChatMenuButton":
+                raise RuntimeError("setChatMenuButton failed: Bad Request")
+            return []
+
+        mocker.patch("stock_bot._request", side_effect=fake)
+        assert (
+            stock_bot.process_update(self._update(42, "/portfolio"), "tok", {"42"})
+            is True
+        )
+        assert any(m == "sendMessage" for m, _ in calls)
 
 
 class TestFormatting:
@@ -601,7 +732,13 @@ class TestSetupMode:
         # It used to exit here, which made the chat ID impossible to discover.
         monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
         monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
-        mocker.patch("stock_bot._request", side_effect=KeyboardInterrupt)
+
+        def fake(token, method, params=None, timeout=None):
+            if method == "getUpdates":
+                raise KeyboardInterrupt
+            return []
+
+        mocker.patch("stock_bot._request", side_effect=fake)
         stock_bot.main()  # returns cleanly rather than raising SystemExit
 
     def test_still_refuses_without_a_token(self, monkeypatch):
