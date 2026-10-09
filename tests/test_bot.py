@@ -580,15 +580,17 @@ class TestBarMenuButton:
     defaults and never breaks a reply.
     """
 
-    EXPECTED_COMMANDS = {
-        "start",
-        "portfolio",
-        "holding",
-        "dividends",
-        "allocation",
-        "news",
-        "help",
-    }
+    EXPECTED_COMMANDS = frozenset(
+        {
+            "start",
+            "portfolio",
+            "holding",
+            "dividends",
+            "allocation",
+            "news",
+            "help",
+        }
+    )
 
     def _update(self, chat_id, text="/start"):
         return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
