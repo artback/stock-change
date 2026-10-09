@@ -604,6 +604,11 @@ def _ack_callback(token, query_id):
         log.warning("answerCallbackQuery failed for %s", query_id)
 
 
+# Telegram's wording when an edit would change nothing. Re-tapping the section
+# the sticky menu already shows is normal use, not a failure.
+_NOT_MODIFIED = "message is not modified"
+
+
 def _edit_message(token, chat_id, message_id, text, markup):
     """Reply in place: edit the pressed menu message with the same flags sends use."""
     params = {
@@ -624,9 +629,11 @@ def process_callback(callback, token, allowed, width=DEFAULT_WIDTH):
     The reply lands in place (an edit of the menu message) so the menu stays
     in one chat position instead of stacking a message per tap; when the
     edit fails — the message scrolled away, expired, an API hiccup — a fresh
-    message carries the same reply instead. Every press is acknowledged,
-    even the ones that are ignored: Telegram keeps the button's spinner
-    spinning until it is answered.
+    message carries the same reply instead. An edit Telegram rejects as
+    "not modified" — the pressed section is already on screen — is a no-op:
+    nothing is sent, only the ack. Every press is acknowledged, even the
+    ones that are ignored: Telegram keeps the button's spinner spinning
+    until it is answered.
     """
     query_id = callback.get("id")
     message = callback.get("message") or {}
@@ -663,13 +670,24 @@ def process_callback(callback, token, allowed, width=DEFAULT_WIDTH):
     if message_id is not None:
         try:
             _edit_message(token, chat_id, message_id, text, markup)
-        except Exception:
-            log.warning(
-                "could not edit message %s in chat %s in place; sending a new message",
-                message_id,
-                chat_id,
-            )
-            send_message(token, chat_id, text, reply_markup=markup)
+        except Exception as exc:
+            if _NOT_MODIFIED in str(exc):
+                # The requested reply is already on screen: no duplicate,
+                # only the ack below.
+                log.info(
+                    "message %s in chat %s unchanged; duplicate not sent",
+                    message_id,
+                    chat_id,
+                )
+            else:
+                log.warning(
+                    "could not edit message %s in chat %s in place (%s); "
+                    "sending a new message",
+                    message_id,
+                    chat_id,
+                    exc,
+                )
+                send_message(token, chat_id, text, reply_markup=markup)
     else:
         # No message to edit (e.g. an inline-mode query): a new message.
         send_message(token, chat_id, text, reply_markup=markup)
