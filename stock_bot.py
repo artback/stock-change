@@ -1,7 +1,9 @@
 """Telegram bot exposing the portfolio to a phone.
 
-Long-polls the Telegram Bot API and answers a handful of read-only commands.
-It reports; it never edits holdings and never places trades.
+Long-polls the Telegram Bot API and answers a handful of read-only commands
+and the inline menu buttons that ride along with every reply — the portfolio
+can be read by tapping, not typing. It reports; it never edits holdings and
+never places trades.
 
 Only chat IDs listed in ``TELEGRAM_ALLOWED_CHAT_IDS`` are answered — without
 that, anyone who finds the bot could read the portfolio. With the allowlist
@@ -71,6 +73,45 @@ HELP = """<b>Portfolio bot</b>
 
 Read-only: this bot cannot change holdings or place trades."""
 
+# /start greets with a short welcome that points at the menu buttons; /help
+# keeps the full command list.
+WELCOME = """<b>Portfolio bot</b>
+
+Tap a button, or send /portfolio — every reply carries the menu.
+
+/help lists all the commands. Read-only: it reports, and never trades."""
+
+# The reply for a failed section; the text and button paths must word it
+# identically, so it lives in one place.
+ERROR_REPLY = "Something went wrong fetching that. Try again shortly."
+
+
+def menu_keyboard():
+    """The standard inline menu: one button per section, each in its own row."""
+    return {
+        "inline_keyboard": [
+            [{"text": "\U0001f4ca Portfolio", "callback_data": "portfolio"}],
+            [{"text": "\U0001f4c8 Holding", "callback_data": "holding"}],
+            [{"text": "\U0001f4b0 Dividends", "callback_data": "dividends"}],
+            [{"text": "\u2696\ufe0f Allocation", "callback_data": "allocation"}],
+            [{"text": "\U0001f4f0 News", "callback_data": "news"}],
+        ]
+    }
+
+
+def holding_keyboard(symbols):
+    """The holding picker: one button per ticker, then the main menu rows.
+
+    Buttons are capped at 20 — the picker text still lists every holding,
+    and the JSON of hundreds of buttons is wasted payload on a phone.
+    """
+    rows = [
+        [{"text": symbol, "callback_data": f"holding:{symbol}"}]
+        for symbol in symbols[:20]
+    ]
+    rows.extend(menu_keyboard()["inline_keyboard"])
+    return {"inline_keyboard": rows}
+
 
 def _request(token, method, params=None, timeout=POLL_TIMEOUT + 10):
     """Call one Telegram Bot API method and return its ``result``."""
@@ -83,21 +124,33 @@ def _request(token, method, params=None, timeout=POLL_TIMEOUT + 10):
     return payload.get("result")
 
 
-def send_message(token, chat_id, text):
-    """Send one HTML message, trimmed to Telegram's size limit."""
+def _trim(text):
+    """Trim to Telegram's size limit, flagging the cut.
+
+    Shared by sends and edits so a long reply is trimmed the same way in
+    both places.
+    """
     if len(text) > MAX_MESSAGE:
-        text = text[: MAX_MESSAGE - 32].rsplit("\n", 1)[0] + "\n… (truncated)"
-    return _request(
-        token,
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        },
-        timeout=20,
-    )
+        return text[: MAX_MESSAGE - 32].rsplit("\n", 1)[0] + "\n… (truncated)"
+    return text
+
+
+def send_message(token, chat_id, text, reply_markup=None):
+    """Send one HTML message, trimmed to Telegram's size limit.
+
+    ``reply_markup`` (an inline keyboard as a dict) rides along when given;
+    the message carries no markup otherwise.
+    """
+    params = {
+        "chat_id": chat_id,
+        "text": _trim(text),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }
+    if reply_markup is not None:
+        # The Bot API wants the markup as a JSON string in the query params.
+        params["reply_markup"] = json.dumps(reply_markup)
+    return _request(token, "sendMessage", params, timeout=20)
 
 
 def render(renderable, width=DEFAULT_WIDTH):
@@ -204,9 +257,7 @@ def _snapshot(width=DEFAULT_WIDTH, *, sections=()):
     if summaries and (aux.get("quote_age") is not None or failed):
         note = stock.stale_quote_note(aux.get("quote_age"), config["holdings"])
         if note or failed:
-            swapped = stock.apply_fallback_quotes(
-                summaries, currency, {}, failed
-            )
+            swapped = stock.apply_fallback_quotes(summaries, currency, {}, failed)
             if swapped:
                 aux["fallback_used"] = swapped
 
@@ -302,8 +353,7 @@ def cmd_portfolio(width=DEFAULT_WIDTH):
     swapped = aux.get("fallback_used")
     if swapped:
         header.append(
-            f"↻ {len(swapped)} quote(s) via backup provider "
-            "(primary feed stalled)"
+            f"↻ {len(swapped)} quote(s) via backup provider (primary feed stalled)"
         )
     else:
         stale = stock.stale_quote_note(aux.get("quote_age"), config["holdings"])
@@ -490,7 +540,9 @@ def handle_command(text, width=DEFAULT_WIDTH):
     command = parts[0].split("@", 1)[0].lower()
     args = parts[1:]
 
-    if command in ("/start", "/help"):
+    if command == "/start":
+        return WELCOME
+    if command == "/help":
         return HELP
     if command in ("/portfolio", "/p"):
         return cmd_portfolio(width)
@@ -509,8 +561,129 @@ def _allowed_chat_ids(raw):
     return {part.strip() for part in (raw or "").split(",") if part.strip()}
 
 
+def _route_callback(data, width):
+    """Map one button press to ``(text, markup)``, or ``None`` if unknown.
+
+    Presses land on the same ``cmd_*`` functions as slash commands, so a
+    button and its command always render identically.
+    """
+    if data == "portfolio":
+        return cmd_portfolio(width), menu_keyboard()
+    if data == "dividends":
+        return cmd_dividends(width), menu_keyboard()
+    if data == "allocation":
+        return cmd_allocation(width), menu_keyboard()
+    if data == "news":
+        return cmd_news(), menu_keyboard()
+    if data == "holding":
+        # A button cannot carry a ticker argument, so "holding" renders the
+        # picker: the text lists every holding, the keyboard one button each.
+        holdings = (stock.load_config() or {}).get("holdings") or {}
+        tickers = sorted(holdings)
+        if tickers:
+            text = (
+                "\U0001f4c8 <b>Holding</b>\n\n"
+                f"Holdings: {html.escape(', '.join(tickers))}\n\n"
+                "Tap one for the detail view."
+            )
+        else:
+            text = "\U0001f4c8 <b>Holding</b>\n\nNo holdings configured."
+        return text, holding_keyboard(tickers)
+    if data.startswith("holding:"):
+        return cmd_holding(data.split(":", 1)[1], width), menu_keyboard()
+    return None
+
+
+def _ack_callback(token, query_id):
+    """Stop the button's spinner. A failure is cosmetic: log, never raise."""
+    try:
+        _request(
+            token, "answerCallbackQuery", {"callback_query_id": query_id}, timeout=20
+        )
+    except Exception:
+        log.warning("answerCallbackQuery failed for %s", query_id)
+
+
+def _edit_message(token, chat_id, message_id, text, markup):
+    """Reply in place: edit the pressed menu message with the same flags sends use."""
+    params = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": _trim(text),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }
+    if markup is not None:
+        params["reply_markup"] = json.dumps(markup)
+    return _request(token, "editMessageText", params, timeout=20)
+
+
+def process_callback(callback, token, allowed, width=DEFAULT_WIDTH):
+    """Answer a button press. Returns True if a reply was sent.
+
+    The reply lands in place (an edit of the menu message) so the menu stays
+    in one chat position instead of stacking a message per tap; when the
+    edit fails — the message scrolled away, expired, an API hiccup — a fresh
+    message carries the same reply instead. Every press is acknowledged,
+    even the ones that are ignored: Telegram keeps the button's spinner
+    spinning until it is answered.
+    """
+    query_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+    data = callback.get("data") or ""
+    message_id = message.get("message_id")
+
+    def ack_only():
+        _ack_callback(token, query_id)
+        return False
+
+    if not allowed:
+        # Setup mode: unconfigured means no data, buttons included.
+        log.warning("unconfigured: ignoring callback from chat %s", chat_id)
+        return ack_only()
+
+    if chat_id not in allowed:
+        # In group chats the buttons are visible to every member; the
+        # silence rule from the text path holds for taps too.
+        log.warning("ignoring callback from chat %s", chat_id)
+        return ack_only()
+
+    try:
+        reply = _route_callback(data, width)
+    except Exception:
+        log.exception("callback failed for %s", data)
+        reply = (ERROR_REPLY, menu_keyboard())
+
+    if reply is None:
+        # Unknown data: acknowledge so the spinner stops, reply nothing.
+        return ack_only()
+
+    text, markup = reply
+    if message_id is not None:
+        try:
+            _edit_message(token, chat_id, message_id, text, markup)
+        except Exception:
+            log.warning(
+                "could not edit message %s in chat %s in place; sending a new message",
+                message_id,
+                chat_id,
+            )
+            send_message(token, chat_id, text, reply_markup=markup)
+    else:
+        # No message to edit (e.g. an inline-mode query): a new message.
+        send_message(token, chat_id, text, reply_markup=markup)
+    _ack_callback(token, query_id)
+    return True
+
+
 def process_update(update, token, allowed, width=DEFAULT_WIDTH):
     """Answer one Telegram update. Returns True if a reply was sent."""
+    callback = update.get("callback_query")
+    if callback:
+        # Button presses arrive through the same long-poll as messages.
+        return process_callback(callback, token, allowed, width)
+
     message = update.get("message") or update.get("edited_message")
     if not message:
         return False
@@ -525,6 +698,7 @@ def process_update(update, token, allowed, width=DEFAULT_WIDTH):
         # their own ID discloses nothing they don't already have; the
         # portfolio stays behind the allowlist.
         log.warning("unconfigured: reporting chat id %s to sender", chat_id)
+        # No menu: unconfigured means no data, buttons included.
         send_message(token, chat_id, SETUP_REPLY.format(chat_id=chat_id))
         return True
 
@@ -537,10 +711,12 @@ def process_update(update, token, allowed, width=DEFAULT_WIDTH):
         reply = handle_command(text, width)
     except Exception:
         log.exception("command failed: %s", text)
-        reply = "Something went wrong fetching that. Try again shortly."
+        reply = ERROR_REPLY
     if reply is None:
         return False
-    send_message(token, chat_id, reply)
+    # Every reply carries the menu, error included, so the chat never
+    # dead-ends into typing.
+    send_message(token, chat_id, reply, reply_markup=menu_keyboard())
     return True
 
 

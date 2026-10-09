@@ -283,6 +283,15 @@ stock-price-bot
 | `/allocation`, `/a` | Position weights and currency exposure |
 | `/news`, `/n` | Recent headlines |
 
+### Menu buttons
+
+`/start` greets you with a short welcome, and every reply — commands *and*
+button presses — carries an inline menu with one button per section, so the
+portfolio can be read by tapping instead of typing. The **Holding** button
+opens a picker with one button per configured ticker (capped at 20); tapping
+a ticker shows that position in detail. All the commands above keep working
+as before.
+
 ### Finding your chat ID
 
 Start the bot without `TELEGRAM_ALLOWED_CHAT_IDS` and message it. It replies
