@@ -292,6 +292,13 @@ opens a picker with one button per configured ticker (capped at 20); tapping
 a ticker shows that position in detail. All the commands above keep working
 as before.
 
+The menu is **sticky**: pressing a button edits the menu message in place
+instead of stacking a new message — re-pressing the section already on
+screen does nothing. The bot also installs itself in the chat header like
+other bots: its menu button there opens the command dropdown (registered via
+`setMyCommands` / `setChatMenuButton`), so the same sections can be reached
+from the bar without touching a message.
+
 ### Finding your chat ID
 
 Start the bot without `TELEGRAM_ALLOWED_CHAT_IDS` and message it. It replies

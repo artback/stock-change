@@ -2,8 +2,9 @@
 
 Long-polls the Telegram Bot API and answers a handful of read-only commands
 and the inline menu buttons that ride along with every reply — the portfolio
-can be read by tapping, not typing. It reports; it never edits holdings and
-never places trades.
+can be read by tapping, not typing. It also registers itself in the chat
+header (command list and menu button), like other bots. It reports; it
+never edits holdings and never places trades.
 
 Only chat IDs listed in ``TELEGRAM_ALLOWED_CHAT_IDS`` are answered — without
 that, anyone who finds the bot could read the portfolio. With the allowlist
@@ -695,6 +696,66 @@ def process_callback(callback, token, allowed, width=DEFAULT_WIDTH):
     return True
 
 
+def set_my_commands(token):
+    """Register the commands Telegram lists in the bot's command menu.
+
+    The dropdown the chat-header button opens shows exactly what is
+    registered here — a bot that never calls this shows only the bare
+    default "Start". The list mirrors handle_command so the menu and the
+    handlers cannot drift apart.
+    """
+    commands = [
+        {"command": "start", "description": "Welcome and the menu"},
+        {"command": "portfolio", "description": "Value, day and month change"},
+        {"command": "holding", "description": "One position in detail"},
+        {"command": "dividends", "description": "Upcoming payouts and 12m income"},
+        {
+            "command": "allocation",
+            "description": "Position weights and currency exposure",
+        },
+        {"command": "news", "description": "Recent headlines"},
+        {"command": "help", "description": "This command list"},
+    ]
+    _request(token, "setMyCommands", {"commands": json.dumps(commands)}, timeout=20)
+
+
+def set_chat_menu_button(token, chat_id):
+    """Turn the chat's header button into the command-menu dropdown.
+
+    The default button shows only a bare "Start"; the "commands" type makes
+    it open the menu setMyCommands registered. Per-chat and idempotent, so
+    it is safe to (re)install.
+    """
+    _request(
+        token,
+        "setChatMenuButton",
+        {"chat_id": chat_id, "button": json.dumps({"type": "commands"})},
+        timeout=20,
+    )
+
+
+# Chats whose bar button this process already installed. Telegram keeps the
+# button until it is changed, so one call per chat is enough.
+_menu_button_chats = set()
+
+
+def _ensure_menu_button(token, chat_id):
+    """Install the bar button for one allowed chat, once per process.
+
+    Cosmetic housekeeping: a failure logs a warning and leaves the default
+    button in place — it never breaks the command reply.
+    """
+    if chat_id in _menu_button_chats:
+        return
+    try:
+        set_chat_menu_button(token, chat_id)
+        _menu_button_chats.add(chat_id)
+    except Exception:
+        log.warning(
+            "setChatMenuButton failed for chat %s; bar button stays default", chat_id
+        )
+
+
 def process_update(update, token, allowed, width=DEFAULT_WIDTH):
     """Answer one Telegram update. Returns True if a reply was sent."""
     callback = update.get("callback_query")
@@ -735,6 +796,9 @@ def process_update(update, token, allowed, width=DEFAULT_WIDTH):
     # Every reply carries the menu, error included, so the chat never
     # dead-ends into typing.
     send_message(token, chat_id, reply, reply_markup=menu_keyboard())
+    # Housekeeping, after the reply: give the chat its header menu button.
+    # Once per chat per process; strangers and setup mode never reach it.
+    _ensure_menu_button(token, chat_id)
     return True
 
 
@@ -755,6 +819,12 @@ def main():
             "TELEGRAM_ALLOWED_CHAT_IDS is not set — setup mode: the bot will "
             "reply with the sender's chat id and serve no portfolio data"
         )
+
+    try:
+        set_my_commands(token)
+    except Exception:
+        # Cosmetic: the command menu stays at Telegram's default list.
+        log.warning("setMyCommands failed; the command menu stays default")
 
     offset = None
     backoff = 1
