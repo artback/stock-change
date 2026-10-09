@@ -5,6 +5,7 @@ which every API call passes, so patching it covers the whole surface.
 """
 
 import html
+import json
 import re
 import time
 
@@ -167,8 +168,10 @@ class TestCommands:
     def test_help(self, portfolio):
         assert "/portfolio" in stock_bot.handle_command("/help")
 
-    def test_start_is_help(self, portfolio):
-        assert stock_bot.handle_command("/start") == stock_bot.handle_command("/help")
+    def test_start_is_welcome_not_help(self):
+        # /start used to duplicate /help; the welcome points at the buttons.
+        assert stock_bot.handle_command("/start") == stock_bot.WELCOME
+        assert stock_bot.handle_command("/start") != stock_bot.handle_command("/help")
 
     def test_group_chat_suffix_is_stripped(self, portfolio):
         assert stock_bot.handle_command("/help@my_bot") is not None
@@ -256,6 +259,238 @@ class TestCommands:
         assert stock_bot.handle_command("   ") is None
 
 
+class TestMenuButtons:
+    """The inline menu makes the bot tappable instead of typed.
+
+    Button presses arrive as callback_query updates. They must be routed to
+    the same cmd_* functions as slash commands, answered in place (an
+    editMessageText that falls back to a fresh sendMessage when the edit
+    fails), and acknowledged so the button's spinner stops. Strangers and
+    setup mode get only the ack — never the portfolio.
+    """
+
+    MENU_DATA = frozenset(
+        {"portfolio", "holding", "dividends", "allocation", "news"}
+    )
+
+    def _update(self, chat_id, text):
+        return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
+
+    def _callback(self, chat_id=42, data="portfolio", message_id=7):
+        return {
+            "update_id": 1,
+            "callback_query": {
+                "id": "cb1",
+                "from": {"id": chat_id},
+                "chat": {"id": chat_id},
+                "message": {"message_id": message_id, "chat": {"id": chat_id}},
+                "data": data,
+            },
+        }
+
+    @staticmethod
+    def _as_markup(markup):
+        """The markup as a dict, whether it arrived JSON-encoded or not."""
+        if markup is None:
+            return {}
+        if isinstance(markup, str):
+            return json.loads(markup)
+        return markup
+
+    def _callback_data(self, markup):
+        """Every callback_data value in an inline keyboard markup."""
+        rows = self._as_markup(markup).get("inline_keyboard", [])
+        return {button["callback_data"] for row in rows for button in row}
+
+    def _valid_markup(self, markup):
+        rows = self._as_markup(markup).get("inline_keyboard")
+        assert isinstance(rows, list) and rows, "inline_keyboard must be non-empty"
+        for row in rows:
+            assert isinstance(row, list) and row
+            for button in row:
+                assert set(button) == {"text", "callback_data"}, button
+                assert button["text"] and button["callback_data"]
+
+    def _edit(self, sent):
+        """The editMessageText call, or fail if the reply was not in place."""
+        return next(c for c in sent if c[0] == "editMessageText")
+
+    def _ack(self, sent):
+        """Every handled or ignored callback must stop the button's spinner."""
+        ack = next(c for c in sent if c[0] == "answerCallbackQuery")
+        assert ack[1]["callback_query_id"] == "cb1"
+
+    def test_start_sends_the_welcome_with_the_menu(self, sent, portfolio):
+        assert (
+            stock_bot.process_update(self._update(42, "/start"), "tok", {"42"})
+            is True
+        )
+        method, params = sent[0]
+        assert method == "sendMessage"
+        # /start is the short welcome from now on, not the full command list.
+        assert params["text"] == stock_bot.WELCOME
+        assert self._callback_data(params.get("reply_markup")) == self.MENU_DATA
+
+    def test_help_keeps_the_command_list_and_gets_the_menu(self, sent, portfolio):
+        stock_bot.process_update(self._update(42, "/help"), "tok", {"42"})
+        method, params = sent[0]
+        assert method == "sendMessage"
+        for command in ("/portfolio", "/holding", "/dividends", "/allocation", "/news"):
+            assert command in params["text"], command
+        assert self._callback_data(params.get("reply_markup")) == self.MENU_DATA
+
+    def test_section_reply_carries_the_menu(self, sent, portfolio):
+        # Every screen stays navigable; the chat never dead-ends into typing.
+        stock_bot.process_update(self._update(42, "/portfolio"), "tok", {"42"})
+        method, params = sent[0]
+        assert method == "sendMessage"
+        assert "MC.PA" in params["text"]
+        assert self._callback_data(params.get("reply_markup")) == self.MENU_DATA
+
+    def test_menu_keyboard_has_the_five_sections(self):
+        markup = stock_bot.menu_keyboard()
+        assert self._callback_data(markup) == self.MENU_DATA
+        self._valid_markup(markup)
+
+    def test_holding_keyboard_lists_every_ticker(self):
+        markup = stock_bot.holding_keyboard(["MC.PA", "IUSA.DE", "AAA.ST"])
+        assert self._callback_data(markup) == self.MENU_DATA | {
+            "holding:MC.PA",
+            "holding:IUSA.DE",
+            "holding:AAA.ST",
+        }
+        self._valid_markup(markup)
+
+    def test_holding_keyboard_caps_ticker_buttons(self):
+        # A hundred buttons is wasted payload on a phone; the picker caps.
+        markup = stock_bot.holding_keyboard([f"T{i:02d}.ST" for i in range(30)])
+        ticker_buttons = sum(
+            1
+            for row in self._as_markup(markup).get("inline_keyboard", [])
+            for button in row
+            if button["callback_data"].startswith("holding:")
+        )
+        assert 0 < ticker_buttons <= 20
+        # The five menu buttons survive the cap.
+        assert self._callback_data(markup) >= self.MENU_DATA
+        self._valid_markup(markup)
+
+    def test_portfolio_callback_edits_the_menu_in_place(self, sent, portfolio):
+        assert stock_bot.process_update(self._callback(), "tok", {"42"}) is True
+        edit = self._edit(sent)
+        assert edit[1]["chat_id"] in (42, "42")
+        assert edit[1]["message_id"] == 7
+        assert "MC.PA" in edit[1]["text"]
+        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA
+        # The reply must land before the spinner is stopped.
+        assert sent.index(edit) < next(
+            i for i, (m, _) in enumerate(sent) if m == "answerCallbackQuery"
+        )
+        self._ack(sent)
+
+    def test_holding_callback_renders_the_picker(self, sent, portfolio):
+        assert stock_bot.process_update(self._callback(data="holding"), "tok", {"42"}) is True
+        edit = self._edit(sent)
+        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA | {
+            "holding:MC.PA",
+            "holding:IUSA.DE",
+        }
+        self._ack(sent)
+
+    def test_holding_ticker_callback_renders_the_detail(self, sent, portfolio):
+        assert (
+            stock_bot.process_update(self._callback(data="holding:MC.PA"), "tok", {"42"})
+            is True
+        )
+        edit = self._edit(sent)
+        # The detail view is cmd_holding output, served in place.
+        assert "21,382" in edit[1]["text"]
+        assert "+18.79%" in edit[1]["text"]
+        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA
+        self._ack(sent)
+
+    def test_holding_unknown_ticker_lists_the_portfolio(self, sent, portfolio):
+        assert (
+            stock_bot.process_update(self._callback(data="holding:NOPE"), "tok", {"42"})
+            is True
+        )
+        edit = self._edit(sent)
+        assert "not in the portfolio" in edit[1]["text"]
+        assert "MC.PA" in edit[1]["text"]
+        self._ack(sent)
+
+    @pytest.mark.parametrize(
+        ("data", "content"),
+        [
+            ("dividends", "Dividends"),
+            ("allocation", "Allocation"),
+            ("news", "LVMH does something"),
+        ],
+    )
+    def test_section_callbacks_render_the_section(self, sent, portfolio, data, content):
+        assert stock_bot.process_update(self._callback(data=data), "tok", {"42"}) is True
+        edit = self._edit(sent)
+        assert content in edit[1]["text"]
+        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA
+        self._ack(sent)
+
+    def test_failing_section_replies_and_still_acks(self, sent, mocker, portfolio):
+        # A section failure must not crash the poll loop.
+        mocker.patch("stock_bot.cmd_portfolio", side_effect=RuntimeError("boom"))
+        stock_bot.process_update(self._callback(), "tok", {"42"})
+        reply = next(c for c in sent if c[0] in ("editMessageText", "sendMessage"))
+        assert "went wrong" in reply[1]["text"]
+        assert self._callback_data(reply[1].get("reply_markup")) == self.MENU_DATA
+        self._ack(sent)
+
+    def test_edit_failure_falls_back_to_a_new_message(self, mocker, portfolio):
+        # The pressed menu message may have scrolled away or expired; the tap
+        # must still produce a reply.
+        calls = []
+
+        def fake(token, method, params=None, timeout=None):
+            calls.append((method, params or {}))
+            if method == "editMessageText":
+                raise RuntimeError("message to edit not found")
+            return []
+
+        mocker.patch("stock_bot._request", side_effect=fake)
+        assert stock_bot.process_update(self._callback(), "tok", {"42"}) is True
+        edit = next(c for c in calls if c[0] == "editMessageText")
+        send = next(c for c in calls if c[0] == "sendMessage")
+        # The fallback carries the same reply, not a refetch or a bare apology.
+        assert "MC.PA" in send[1]["text"]
+        assert send[1]["text"] == edit[1]["text"]
+        assert send[1]["chat_id"] in (42, "42")
+        assert self._callback_data(send[1].get("reply_markup")) == self.MENU_DATA
+        self._ack(calls)
+
+    def test_stranger_callback_gets_only_an_ack(self, sent, portfolio):
+        # In a group chat the buttons are visible to every member; the silence
+        # rule from the text path must hold for taps too.
+        assert stock_bot.process_update(self._callback(chat_id=999), "tok", {"42"}) is False
+        methods = [m for m, _ in sent]
+        assert "sendMessage" not in methods
+        assert "editMessageText" not in methods
+        assert methods.count("answerCallbackQuery") == 1
+        assert not any("MC.PA" in str(params) for _, params in sent)
+
+    def test_setup_mode_callback_serves_nothing(self, sent, portfolio):
+        assert stock_bot.process_update(self._callback(), "tok", set()) is False
+        methods = [m for m, _ in sent]
+        assert "sendMessage" not in methods
+        assert "editMessageText" not in methods
+        assert "answerCallbackQuery" in methods
+        assert not any("MC.PA" in str(params) for _, params in sent)
+
+    def test_unknown_callback_data_is_silenced_but_acked(self, sent, portfolio):
+        assert (
+            stock_bot.process_update(self._callback(data="bogus"), "tok", {"42"})
+            is False
+        )
+        assert [m for m, _ in sent] == ["answerCallbackQuery"]
+
+
 class TestFormatting:
     def test_code_block_escapes_html(self):
         assert "&lt;b&gt;" in stock_bot.as_code_block("<b>")
@@ -298,6 +533,11 @@ class TestSetupMode:
     def test_says_it_is_unconfigured(self, sent, portfolio):
         stock_bot.process_update(self._update(), "tok", set())
         assert "Not configured" in sent[0][1]["text"]
+
+    def test_setup_reply_carries_no_menu(self, sent, portfolio):
+        # Unconfigured means no data — buttons would be a dead end too.
+        stock_bot.process_update(self._update(), "tok", set())
+        assert "reply_markup" not in sent[0][1]
 
     def test_serves_no_portfolio_data(self, sent, portfolio):
         stock_bot.process_update(self._update(text="/portfolio"), "tok", set())
