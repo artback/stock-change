@@ -54,15 +54,30 @@ def portfolio(mocker):
     )
     summaries = {
         "MC.PA": {
-            "symbol": "MC.PA", "qty": 45, "val_now": 21381.75, "val_prev": 21000.0,
-            "chg_pct": 1.82, "daily_chg_val": 381.75, "source_currency": "EUR",
-            "conv": 1.0, "price": 475.15, "cost": 400.0, "cost_value": 18000.0,
-            "unrealized": 3381.75, "return_pct": 18.79,
+            "symbol": "MC.PA",
+            "qty": 45,
+            "val_now": 21381.75,
+            "val_prev": 21000.0,
+            "chg_pct": 1.82,
+            "daily_chg_val": 381.75,
+            "source_currency": "EUR",
+            "conv": 1.0,
+            "price": 475.15,
+            "cost": 400.0,
+            "cost_value": 18000.0,
+            "unrealized": 3381.75,
+            "return_pct": 18.79,
         },
         "IUSA.DE": {
-            "symbol": "IUSA.DE", "qty": 720, "val_now": 46340.64, "val_prev": 46000.0,
-            "chg_pct": 0.74, "daily_chg_val": 340.64, "source_currency": "EUR",
-            "conv": 1.0, "price": 64.36,
+            "symbol": "IUSA.DE",
+            "qty": 720,
+            "val_now": 46340.64,
+            "val_prev": 46000.0,
+            "chg_pct": 0.74,
+            "daily_chg_val": 340.64,
+            "source_currency": "EUR",
+            "conv": 1.0,
+            "price": 64.36,
         },
     }
     mocker.patch(
@@ -72,23 +87,37 @@ def portfolio(mocker):
     mocker.patch(
         "stock.fetch_auxiliary",
         return_value={
-            "history": [100.0, 110.0], "monthly": {"MC.PA": -2.23}, "traded": None,
+            "history": [100.0, 110.0],
+            "monthly": {"MC.PA": -2.23},
+            "traded": None,
             "dividends": {
                 "MC.PA": {
-                    "symbol": "MC.PA", "ex_date": "2026-12-01", "amt": 5.5,
-                    "total_p": 247.5, "cur_label": "€", "ttm_per_share": 13.0,
-                    "ttm_total": 585.0, "yield_pct": 2.74,
+                    "symbol": "MC.PA",
+                    "ex_date": "2026-12-01",
+                    "amt": 5.5,
+                    "total_p": 247.5,
+                    "cur_label": "€",
+                    "ttm_per_share": 13.0,
+                    "ttm_total": 585.0,
+                    "yield_pct": 2.74,
                     "yield_on_cost_pct": 3.25,
                 }
             },
             "news": [
-                {"symbol": "MC.PA", "title": "LVMH does something",
-                 "link": "https://example.com/a", "provider": "Reuters",
-                 "pub_date": "2026-08-03 10:00", "summary": "A summary."}
+                {
+                    "symbol": "MC.PA",
+                    "title": "LVMH does something",
+                    "link": "https://example.com/a",
+                    "provider": "Reuters",
+                    "pub_date": "2026-08-03 10:00",
+                    "summary": "A summary.",
+                }
             ],
             "analysts": {
                 "MC.PA": {
-                    "consensus": "Buy", "trend": "steady", "analyst_count": 25,
+                    "consensus": "Buy",
+                    "trend": "steady",
+                    "analyst_count": 25,
                     "price_target": {"upside_pct": 19.8},
                 }
             },
@@ -105,9 +134,7 @@ class TestAccessControl:
         return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
 
     def test_allowed_chat_is_answered(self, sent, portfolio):
-        assert (
-            stock_bot.process_update(self._update(42), "tok", {"42"}) is True
-        )
+        assert stock_bot.process_update(self._update(42), "tok", {"42"}) is True
         assert sent[0][0] == "sendMessage"
 
     def test_unknown_chat_gets_nothing(self, sent, portfolio):
@@ -195,14 +222,26 @@ class TestCommands:
         # passes without the sort doing anything.
         summaries = {
             "AAA.ST": {
-                "symbol": "AAA.ST", "qty": 1, "val_now": 100.0, "val_prev": 100.0,
-                "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "EUR",
-                "conv": 1.0, "price": 100.0,
+                "symbol": "AAA.ST",
+                "qty": 1,
+                "val_now": 100.0,
+                "val_prev": 100.0,
+                "chg_pct": 0.0,
+                "daily_chg_val": 0.0,
+                "source_currency": "EUR",
+                "conv": 1.0,
+                "price": 100.0,
             },
             "ZZZ.ST": {
-                "symbol": "ZZZ.ST", "qty": 1, "val_now": 9000.0, "val_prev": 9000.0,
-                "chg_pct": 0.0, "daily_chg_val": 0.0, "source_currency": "EUR",
-                "conv": 1.0, "price": 9000.0,
+                "symbol": "ZZZ.ST",
+                "qty": 1,
+                "val_now": 9000.0,
+                "val_prev": 9000.0,
+                "chg_pct": 0.0,
+                "daily_chg_val": 0.0,
+                "source_currency": "EUR",
+                "conv": 1.0,
+                "price": 9000.0,
             },
         }
         mocker.patch("stock.fetch_summaries", return_value=(summaries, {}, []))
@@ -269,9 +308,7 @@ class TestMenuButtons:
     setup mode get only the ack — never the portfolio.
     """
 
-    MENU_DATA = frozenset(
-        {"portfolio", "holding", "dividends", "allocation", "news"}
-    )
+    MENU_DATA = frozenset({"portfolio", "holding", "dividends", "allocation", "news"})
 
     def _update(self, chat_id, text):
         return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
@@ -322,8 +359,7 @@ class TestMenuButtons:
 
     def test_start_sends_the_welcome_with_the_menu(self, sent, portfolio):
         assert (
-            stock_bot.process_update(self._update(42, "/start"), "tok", {"42"})
-            is True
+            stock_bot.process_update(self._update(42, "/start"), "tok", {"42"}) is True
         )
         method, params = sent[0]
         assert method == "sendMessage"
@@ -389,7 +425,10 @@ class TestMenuButtons:
         self._ack(sent)
 
     def test_holding_callback_renders_the_picker(self, sent, portfolio):
-        assert stock_bot.process_update(self._callback(data="holding"), "tok", {"42"}) is True
+        assert (
+            stock_bot.process_update(self._callback(data="holding"), "tok", {"42"})
+            is True
+        )
         edit = self._edit(sent)
         assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA | {
             "holding:MC.PA",
@@ -399,7 +438,9 @@ class TestMenuButtons:
 
     def test_holding_ticker_callback_renders_the_detail(self, sent, portfolio):
         assert (
-            stock_bot.process_update(self._callback(data="holding:MC.PA"), "tok", {"42"})
+            stock_bot.process_update(
+                self._callback(data="holding:MC.PA"), "tok", {"42"}
+            )
             is True
         )
         edit = self._edit(sent)
@@ -428,7 +469,9 @@ class TestMenuButtons:
         ],
     )
     def test_section_callbacks_render_the_section(self, sent, portfolio, data, content):
-        assert stock_bot.process_update(self._callback(data=data), "tok", {"42"}) is True
+        assert (
+            stock_bot.process_update(self._callback(data=data), "tok", {"42"}) is True
+        )
         edit = self._edit(sent)
         assert content in edit[1]["text"]
         assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA
@@ -468,7 +511,10 @@ class TestMenuButtons:
     def test_stranger_callback_gets_only_an_ack(self, sent, portfolio):
         # In a group chat the buttons are visible to every member; the silence
         # rule from the text path must hold for taps too.
-        assert stock_bot.process_update(self._callback(chat_id=999), "tok", {"42"}) is False
+        assert (
+            stock_bot.process_update(self._callback(chat_id=999), "tok", {"42"})
+            is False
+        )
         methods = [m for m, _ in sent]
         assert "sendMessage" not in methods
         assert "editMessageText" not in methods
@@ -585,10 +631,18 @@ class TestPartialCostBasis:
     def test_no_qualifier_when_everything_is_priced(self, mocker, portfolio):
         summaries = {
             "MC.PA": {
-                "symbol": "MC.PA", "qty": 45, "val_now": 21381.75,
-                "val_prev": 21000.0, "chg_pct": 1.82, "daily_chg_val": 381.75,
-                "source_currency": "EUR", "conv": 1.0, "price": 475.15,
-                "cost": 400.0, "cost_value": 18000.0, "unrealized": 3381.75,
+                "symbol": "MC.PA",
+                "qty": 45,
+                "val_now": 21381.75,
+                "val_prev": 21000.0,
+                "chg_pct": 1.82,
+                "daily_chg_val": 381.75,
+                "source_currency": "EUR",
+                "conv": 1.0,
+                "price": 475.15,
+                "cost": 400.0,
+                "cost_value": 18000.0,
+                "unrealized": 3381.75,
                 "return_pct": 18.79,
             }
         }
@@ -605,9 +659,15 @@ class TestPartialCostBasis:
     def test_no_pl_line_without_any_cost_basis(self, mocker, portfolio):
         summaries = {
             "IUSA.DE": {
-                "symbol": "IUSA.DE", "qty": 720, "val_now": 46340.64,
-                "val_prev": 46000.0, "chg_pct": 0.74, "daily_chg_val": 340.64,
-                "source_currency": "EUR", "conv": 1.0, "price": 64.36,
+                "symbol": "IUSA.DE",
+                "qty": 720,
+                "val_now": 46340.64,
+                "val_prev": 46000.0,
+                "chg_pct": 0.74,
+                "daily_chg_val": 340.64,
+                "source_currency": "EUR",
+                "conv": 1.0,
+                "price": 64.36,
             }
         }
         mocker.patch("stock.fetch_summaries", return_value=(summaries, {}, []))
@@ -623,8 +683,14 @@ class TestFetching:
     def aux(self, portfolio, mocker):
         return mocker.patch(
             "stock.fetch_auxiliary",
-            return_value={"history": [1.0, 2.0], "monthly": {}, "traded": None,
-                          "dividends": {}, "news": [], "analysts": {}},
+            return_value={
+                "history": [1.0, 2.0],
+                "monthly": {},
+                "traded": None,
+                "dividends": {},
+                "news": [],
+                "analysts": {},
+            },
         )
 
     def _wants(self, call):
@@ -665,16 +731,34 @@ class TestCaching:
     def fetches(self, portfolio, mocker):
         mocker.patch(
             "stock.fetch_auxiliary",
-            return_value={"history": [1.0, 2.0], "monthly": {}, "traded": None,
-                          "dividends": {}, "news": [], "analysts": {}},
+            return_value={
+                "history": [1.0, 2.0],
+                "monthly": {},
+                "traded": None,
+                "dividends": {},
+                "news": [],
+                "analysts": {},
+            },
         )
         return mocker.patch(
             "stock.fetch_summaries",
-            return_value=({"MC.PA": {
-                "symbol": "MC.PA", "qty": 45, "val_now": 21381.75,
-                "val_prev": 21000.0, "chg_pct": 1.82, "daily_chg_val": 381.75,
-                "source_currency": "EUR", "conv": 1.0, "price": 475.15,
-            }}, {"MC.PA": "EUR"}, []),
+            return_value=(
+                {
+                    "MC.PA": {
+                        "symbol": "MC.PA",
+                        "qty": 45,
+                        "val_now": 21381.75,
+                        "val_prev": 21000.0,
+                        "chg_pct": 1.82,
+                        "daily_chg_val": 381.75,
+                        "source_currency": "EUR",
+                        "conv": 1.0,
+                        "price": 475.15,
+                    }
+                },
+                {"MC.PA": "EUR"},
+                [],
+            ),
         )
 
     def test_repeat_commands_reuse_prices(self, fetches):
@@ -700,8 +784,7 @@ class TestCaching:
         # goes stale would put the slowest calls back on every command.
         aux = mocker.patch(
             "stock.fetch_auxiliary",
-            return_value={"analysts": {}, "history": [], "monthly": {},
-                          "traded": None},
+            return_value={"analysts": {}, "history": [], "monthly": {}, "traded": None},
         )
         stock_bot.handle_command("/holding MC.PA")
         clock = [time.monotonic() + stock_bot.SUMMARY_TTL + 1]
