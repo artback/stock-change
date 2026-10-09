@@ -11,6 +11,7 @@ Run it with ``stock-price-mcp`` (installed by the ``mcp`` extra).
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 import stock
@@ -90,7 +91,10 @@ def get_holding(symbol: str, currency: str | None = None) -> dict[str, Any]:
                 **position,
             }
     held = [p["symbol"] for p in payload["positions"]]
-    raise ValueError(f"{wanted} is not in the portfolio. Holdings: {', '.join(held)}")
+    # ToolError, not ValueError: under mcp>=2.3 a deliberate ToolError reaches
+    # the client with its message, while a bare exception degrades to a
+    # generic "Error executing tool" crash with the detail only in logs.
+    raise ToolError(f"{wanted} is not in the portfolio. Holdings: {', '.join(held)}")
 
 
 @server.tool(annotations=_READ)
@@ -110,7 +114,7 @@ def get_analyst_view(symbol: str) -> dict[str, Any]:
     """
     view = stock.analyst_view(symbol)
     if view is None:
-        raise ValueError(f"'{symbol}' does not resolve to a known ticker")
+        raise ToolError(f"'{symbol}' does not resolve to a known ticker")
     return view
 
 
@@ -192,7 +196,10 @@ def remove_holding(symbol: str) -> dict[str, Any]:
     Args:
         symbol: Ticker to drop, e.g. "AAPL".
     """
-    result = stock.remove_holding(symbol)
+    try:
+        result = stock.remove_holding(symbol)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
     result["note"] = "Removed from the tracked portfolio. No trade was placed."
     return result
 
@@ -206,12 +213,17 @@ def _write_holding(symbol: str, apply) -> dict[str, Any]:
     """
     instrument = stock.resolve_symbol(symbol)
     if instrument["status"] == "unknown":
-        raise ValueError(
+        raise ToolError(
             f"'{symbol}' does not resolve to a known ticker. Non-US listings "
             f"need their Yahoo Finance exchange suffix — e.g. MC.PA, SVOL-B.ST."
         )
 
-    result = apply(instrument["symbol"])
+    try:
+        result = apply(instrument["symbol"])
+    except ValueError as exc:
+        # Validation refusals (negative quantity, overselling) are things the
+        # model should read and correct, not framework crashes.
+        raise ToolError(str(exc)) from exc
     result["instrument"] = instrument
     result["note"] = "Holdings file updated. No trade was placed."
     if instrument["status"] == "unverified":

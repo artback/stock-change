@@ -16,7 +16,11 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 mcp = [
-    "mcp>=2.0.0",
+    # 2.3 is what stock_mcp.py relies on: a deliberate ToolError reaches the
+    # client with its message, while a bare exception degrades to a generic
+    # "Error executing tool" crash. Unpinning this is how the tool tests broke
+    # on 2026-10-09 — the same drift trap as the ruff pin below.
+    "mcp>=2.3.0",
     # Round-trips the holdings YAML so editing it keeps comments and key order.
     "ruamel.yaml>=0.18.0",
 ]
