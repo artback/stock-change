@@ -7,7 +7,12 @@ name = "stock-price"
 dynamic = ["version"]
 description = "A simple CLI to track stock prices and dividends"
 dependencies = [
-    "yfinance>=0.2.40",
+    # Pinned, not ranged: pip resolves this on every container start and CI
+    # run, and the latest yfinance/pandas pair (1.7.0/3.1.0) flooded the bot's
+    # logs with deprecation warnings and grew memory until it was OOM-killed.
+    # 1.1.0 with pandas 3.0.x is the tested pair.
+    "yfinance==1.1.0",
+    "pandas>=3.0,<3.1",
     "rich>=13.7.0",
     "python-dotenv>=1.0.0",
     "PyYAML>=6.0.0",

@@ -22,12 +22,12 @@ def _plain(text):
 @pytest.fixture(autouse=True)
 def _clear_cache():
     """The bot caches between commands; tests must not inherit each other's."""
-    for name in ("_cache", "_menu_button_chats"):
+    for name in ("_cache", "_rate_cache", "_menu_button_chats"):
         state = getattr(stock_bot, name, None)
         if state is not None:
             state.clear()
     yield
-    for name in ("_cache", "_menu_button_chats"):
+    for name in ("_cache", "_rate_cache", "_menu_button_chats"):
         state = getattr(stock_bot, name, None)
         if state is not None:
             state.clear()
@@ -931,6 +931,20 @@ class TestCaching:
         stock_bot.handle_command("/holding MC.PA")
         assert fetches.call_count == 2
         assert aux.call_count == 1
+
+
+class TestBackgroundRefresh:
+    def test_refresh_warms_the_cache_for_commands(self, portfolio, mocker):
+        stock_bot._refresh()
+        fetches = mocker.patch("stock.fetch_summaries")
+        out = stock_bot.handle_command("/portfolio")
+        assert "MC.PA" in out
+        fetches.assert_not_called()
+
+    def test_failed_refresh_leaves_the_cache_empty(self, portfolio, mocker):
+        mocker.patch("stock.fetch_summaries", side_effect=RuntimeError("down"))
+        stock_bot._refresh()
+        assert "summaries" not in stock_bot._cache
 
 
 class TestTickerLinks:

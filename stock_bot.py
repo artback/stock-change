@@ -24,6 +24,7 @@ import html
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -48,7 +49,13 @@ POLL_TIMEOUT = 30
 # per message. Sections are cached for as long as they stay meaningful —
 # prices move constantly, analyst ratings and dividend schedules do not — and
 # each command asks only for what it actually shows.
-SUMMARY_TTL = 60
+# The bot idles between commands, so the first command after any quiet gap
+# used to pay the full fetch on the phone. A background refresher keeps the
+# cache warm on its own clock; SUMMARY_TTL tracks the interval so a command
+# trusts one interval of cached quotes and degrades to a fetch if the
+# refresher dies.
+REFRESH_INTERVAL = int(os.environ.get("STOCK_BOT_REFRESH_INTERVAL", "120"))
+SUMMARY_TTL = REFRESH_INTERVAL
 HISTORY_TTL = 300
 SLOW_TTL = 600
 
@@ -173,6 +180,10 @@ def as_code_block(text):
 
 _cache = {}
 
+# FX rates are reference rates, stable for hours, so one per-process cache
+# spares the refresher from re-fetching them every cycle.
+_rate_cache = {}
+
 
 def _cached(key, ttl, produce):
     """Return a cached value, refreshing it once it is older than ``ttl``."""
@@ -264,6 +275,54 @@ def _snapshot(width=DEFAULT_WIDTH, *, sections=()):
 
     stock.apply_holiday_zeroing(summaries, aux.get("traded"))
     return config, currency, summaries, aux, failed
+
+
+def _refresh():
+    """Rebuild the cached quotes so the next command answers from memory."""
+    try:
+        config, currency = _config()
+    except Exception:
+        log.exception("background refresh: config unreadable")
+        return
+    started = time.monotonic()
+    try:
+        summaries, ticker_to_currency, failed = stock.fetch_summaries(
+            config["holdings"],
+            currency,
+            _rate_cache,
+            {},
+            cost_basis=config.get("cost_basis"),
+        )
+    except Exception:
+        log.exception("background refresh: quote fetch failed")
+        return
+    _cache["summaries"] = (time.monotonic(), (summaries, ticker_to_currency, failed))
+    if summaries:
+        try:
+            aux = stock.fetch_auxiliary(
+                config["holdings"],
+                currency,
+                summaries,
+                ticker_to_currency,
+                want_quote_age=True,
+            )
+        except Exception:
+            log.exception("background refresh: quote age fetch failed")
+        else:
+            if aux.get("quote_age") is not None:
+                _cache["aux:quote_age"] = (time.monotonic(), {"quote_age": aux["quote_age"]})
+    log.info(
+        "refreshed %d/%d holdings in %.1fs",
+        len(summaries),
+        len(config["holdings"]),
+        time.monotonic() - started,
+    )
+
+
+def _refresher():
+    while True:
+        _refresh()
+        time.sleep(REFRESH_INTERVAL)
 
 
 # Tapping a ticker should go somewhere useful. Link previews are disabled on
@@ -814,6 +873,7 @@ def main():
     width = int(os.environ.get("STOCK_BOT_WIDTH", DEFAULT_WIDTH))
     if allowed:
         log.info("listening, serving %d chat(s)", len(allowed))
+        threading.Thread(target=_refresher, name="quote-refresher", daemon=True).start()
     else:
         log.warning(
             "TELEGRAM_ALLOWED_CHAT_IDS is not set — setup mode: the bot will "
