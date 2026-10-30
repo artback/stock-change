@@ -106,14 +106,15 @@ job "stock-bot" {
           # a few files. Pinned to a tag so an unattended restart can't pull an
           # untested main.
           pip install --no-cache-dir --quiet \
-            "https://github.com/artback/stock-change/archive/refs/tags/v0.10.2.tar.gz"
+            "https://github.com/artback/stock-change/archive/refs/tags/v0.12.0.tar.gz"
           exec stock-price-bot
         EOT
       }
 
       resources {
-        cpu    = 500
-        memory = 384
+        cpu        = 500
+        memory     = 384
+        memory_max = 768
       }
     }
   }
