@@ -310,7 +310,10 @@ def _refresh():
             log.exception("background refresh: quote age fetch failed")
         else:
             if aux.get("quote_age") is not None:
-                _cache["aux:quote_age"] = (time.monotonic(), {"quote_age": aux["quote_age"]})
+                _cache["aux:quote_age"] = (
+                    time.monotonic(),
+                    {"quote_age": aux["quote_age"]},
+                )
     log.info(
         "refreshed %d/%d holdings in %.1fs",
         len(summaries),
@@ -664,36 +667,37 @@ def _ack_callback(token, query_id):
         log.warning("answerCallbackQuery failed for %s", query_id)
 
 
-# Telegram's wording when an edit would change nothing. Re-tapping the section
-# the sticky menu already shows is normal use, not a failure.
-_NOT_MODIFIED = "message is not modified"
+def _delete_message(token, chat_id, message_id):
+    """Clear the pressed menu message so the fresh reply reads as an in-place
+    update.
 
-
-def _edit_message(token, chat_id, message_id, text, markup):
-    """Reply in place: edit the pressed menu message with the same flags sends use."""
-    params = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": _trim(text),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }
-    if markup is not None:
-        params["reply_markup"] = json.dumps(markup)
-    return _request(token, "editMessageText", params, timeout=20)
+    A failure is cosmetic — the message may already be gone, in which case
+    there is nothing left to clear: the new reply goes out either way.
+    """
+    try:
+        _request(
+            token,
+            "deleteMessage",
+            {"chat_id": chat_id, "message_id": message_id},
+            timeout=20,
+        )
+    except Exception as exc:
+        log.info(
+            "could not delete message %s in chat %s (%s); the reply still goes out",
+            message_id,
+            chat_id,
+            exc,
+        )
 
 
 def process_callback(callback, token, allowed, width=DEFAULT_WIDTH):
     """Answer a button press. Returns True if a reply was sent.
 
-    The reply lands in place (an edit of the menu message) so the menu stays
-    in one chat position instead of stacking a message per tap; when the
-    edit fails — the message scrolled away, expired, an API hiccup — a fresh
-    message carries the same reply instead. An edit Telegram rejects as
-    "not modified" — the pressed section is already on screen — is a no-op:
-    nothing is sent, only the ack. Every press is acknowledged, even the
-    ones that are ignored: Telegram keeps the button's spinner spinning
-    until it is answered.
+    The pressed menu message is cleared and a fresh one created in its place,
+    so a tap reads as an in-place update instead of stacking a message per
+    tap; when the old message is already gone the fresh reply still goes out.
+    Every press is acknowledged, even the ones that are ignored: Telegram
+    keeps the button's spinner spinning until it is answered.
     """
     query_id = callback.get("id")
     message = callback.get("message") or {}
@@ -728,29 +732,8 @@ def process_callback(callback, token, allowed, width=DEFAULT_WIDTH):
 
     text, markup = reply
     if message_id is not None:
-        try:
-            _edit_message(token, chat_id, message_id, text, markup)
-        except Exception as exc:
-            if _NOT_MODIFIED in str(exc):
-                # The requested reply is already on screen: no duplicate,
-                # only the ack below.
-                log.info(
-                    "message %s in chat %s unchanged; duplicate not sent",
-                    message_id,
-                    chat_id,
-                )
-            else:
-                log.warning(
-                    "could not edit message %s in chat %s in place (%s); "
-                    "sending a new message",
-                    message_id,
-                    chat_id,
-                    exc,
-                )
-                send_message(token, chat_id, text, reply_markup=markup)
-    else:
-        # No message to edit (e.g. an inline-mode query): a new message.
-        send_message(token, chat_id, text, reply_markup=markup)
+        _delete_message(token, chat_id, message_id)
+    send_message(token, chat_id, text, reply_markup=markup)
     _ack_callback(token, query_id)
     return True
 
@@ -873,7 +856,12 @@ def main():
     width = int(os.environ.get("STOCK_BOT_WIDTH", DEFAULT_WIDTH))
     if allowed:
         log.info("listening, serving %d chat(s)", len(allowed))
-        threading.Thread(target=_refresher, name="quote-refresher", daemon=True).start()
+        # No config file, no background refresh: the built-in demo holdings
+        # are not a portfolio worth keeping warm.
+        if stock.resolve_config_path().exists():
+            threading.Thread(
+                target=_refresher, name="quote-refresher", daemon=True
+            ).start()
     else:
         log.warning(
             "TELEGRAM_ALLOWED_CHAT_IDS is not set — setup mode: the bot will "

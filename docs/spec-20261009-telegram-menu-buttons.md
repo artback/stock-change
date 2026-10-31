@@ -172,3 +172,34 @@ a Telegram limitation, which is this bot's use case.)
   successful command reply.
 - `tests/test_bot.py` — no-op re-tap, command-list registration, once-per-
   chat install, stranger/setup silence, install-failure safety.
+## Follow-up (v0.12.1): taps clear and recreate instead of editing
+
+Field report after the v0.11.1 deploy: taps still posted *new* messages. The
+in-place edit is the fragile half of the feature — `editMessageText` fails
+with a bare `400` whenever the pressed message can no longer be edited (the
+live log shows repeated "could not edit message … in place (HTTP Error 400:
+Bad Request); sending a new message"), and each failure stacks a fresh
+message below the still-visible old one.
+
+The v0.12.1 model is simpler and matches how the menu should read on the
+phone: a tap **clears the pressed menu message** (`deleteMessage`) and
+**creates a fresh one** (`sendMessage` with the same markup). The chat
+always shows exactly the latest section, and it reads as an in-place
+update. A delete failure (the message is already gone) is cosmetic and
+logged at info level; the reply goes out either way. The `message is not
+modified` no-op disappears with editing: re-tapping the shown section simply
+refreshes it — v0.12.0's background refresher keeps the cache warm, so the
+refresh is instant.
+
+### Contract changes (v0.12.1)
+
+- `process_callback` — `deleteMessage` on the pressed message, then always
+  `sendMessage`; `_edit_message` and the `_NOT_MODIFIED` no-op are gone.
+- New: `_delete_message` — a failed delete logs at info and never raises.
+- `main()` — the background refresher (v0.12.0) now starts only when a
+  config file exists; without one the bot serves the built-in demo
+  holdings, which the refresher must not fetch (the `main()` tests run
+  without a config and would otherwise trigger live network calls).
+- `tests/test_bot.py` — callback specs re-pointed from `editMessageText`
+  to `deleteMessage` + `sendMessage`; the no-op re-tap test is deleted;
+  refresher-startup tests added.
