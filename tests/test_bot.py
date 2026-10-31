@@ -11,6 +11,7 @@ import threading
 import time
 
 import pytest
+import yaml
 
 import stock
 import stock_bot
@@ -571,6 +572,9 @@ class TestBarMenuButton:
             "dividends",
             "allocation",
             "news",
+            "buy",
+            "sell",
+            "remove",
             "help",
         }
     )
@@ -993,3 +997,215 @@ class TestTickerLinks:
         # Eight linked tickers would otherwise expand into preview cards.
         stock_bot.send_message("tok", 42, "hi")
         assert sent[0][1]["disable_web_page_preview"] == "true"
+
+
+class TestInventoryCommands:
+    """/buy, /sell and /remove are the bot's write path: record a position
+    the user already owns into the holdings file.
+
+    Each command validates the ticker against the price service (a typo'd
+    ticker is refused, an unreachable one is recorded with a note), applies
+    the change through the stock module's write API, clears the quote cache
+    so the reply renders the updated portfolio, and sends a confirmation with
+    the menu. Strangers never reach the write at all.
+    """
+
+    def _update(self, chat_id, text):
+        return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
+
+    @pytest.fixture
+    def holdings_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "stock.yaml"
+        path.write_text(
+            "holdings:\n"
+            "  MC.PA:\n"
+            "    qty: 45\n"
+            "    cost: 400\n"
+            "  IUSA.DE: 720\n"
+            "currency: EUR\n"
+        )
+        monkeypatch.setenv("STOCK_PRICE_CONFIG", str(path))
+        return path
+
+    @staticmethod
+    def _load(holdings_file):
+        return yaml.safe_load(holdings_file.read_text())
+
+    @pytest.fixture
+    def ok_ticker(self, mocker):
+        def fake(symbol):
+            return {
+                "symbol": symbol.upper(),
+                "status": "ok",
+                "name": None,
+                "price": 100.0,
+                "currency": "EUR",
+            }
+
+        mocker.patch("stock.resolve_symbol", side_effect=fake)
+
+    @pytest.fixture
+    def quotes(self, mocker):
+        # The confirmation renders the updated portfolio; these keep it
+        # deterministic and network-free, whatever the file now holds.
+        def fake_fetch(holdings, currency, *args, **kwargs):
+            summaries = {}
+            for symbol, entry in holdings.items():
+                qty = entry.get("qty") if isinstance(entry, dict) else entry
+                summaries[symbol] = {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "val_now": 100.0 * qty,
+                    "val_prev": 100.0 * qty,
+                    "chg_pct": 0.0,
+                    "daily_chg_val": 0.0,
+                    "source_currency": currency,
+                    "conv": 1.0,
+                    "price": 100.0,
+                }
+            return summaries, {s: currency for s in holdings}, []
+
+        mocker.patch("stock.fetch_summaries", side_effect=fake_fetch)
+        mocker.patch("stock.fetch_auxiliary", return_value={})
+
+    @staticmethod
+    def _sent_reply(sent):
+        return html.unescape(next(c for c in sent if c[0] == "sendMessage")[1]["text"])
+
+    def test_buy_records_the_purchase(self, sent, holdings_file, ok_ticker, quotes):
+        assert (
+            stock_bot.process_update(
+                self._update(42, "/buy MC.PA 5 500"), "tok", {"42"}
+            )
+            is True
+        )
+        text = self._sent_reply(sent)
+        assert "Bought 5 MC.PA @ 500" in text
+        assert "now holding 50" in text
+        assert "was 45" in text
+        # The updated portfolio and the menu ride along.
+        assert "Portfolio" in text
+        assert "IUSA.DE" in text
+        document = self._load(holdings_file)
+        # The purchase is blended into the average cost: (45*400+5*500)/50.
+        assert document["holdings"]["MC.PA"] == {"qty": 50, "cost": 410}
+        assert document["holdings"]["IUSA.DE"] == 720
+
+    def test_buy_new_ticker_adds_it(self, sent, holdings_file, ok_ticker, quotes):
+        stock_bot.process_update(self._update(42, "/buy NOVEL.DE 10 12"), "tok", {"42"})
+        document = self._load(holdings_file)
+        assert document["holdings"]["NOVEL.DE"] == {"qty": 10, "cost": 12}
+
+    def test_buy_without_cost_leaves_the_basis_untouched(
+        self, sent, holdings_file, ok_ticker, quotes
+    ):
+        stock_bot.process_update(self._update(42, "/buy MC.PA 5"), "tok", {"42"})
+        document = self._load(holdings_file)
+        assert document["holdings"]["MC.PA"] == {"qty": 50, "cost": 400}
+
+    def test_sell_reduces_the_position(self, sent, holdings_file, ok_ticker, quotes):
+        stock_bot.process_update(self._update(42, "/sell MC.PA 5"), "tok", {"42"})
+        text = self._sent_reply(sent)
+        assert "Sold 5 MC.PA" in text
+        assert "now holding 40" in text
+        document = self._load(holdings_file)
+        # A sale leaves the recorded basis untouched.
+        assert document["holdings"]["MC.PA"] == {"qty": 40, "cost": 400}
+
+    def test_selling_out_removes_the_position(
+        self, sent, holdings_file, ok_ticker, quotes
+    ):
+        stock_bot.process_update(self._update(42, "/sell MC.PA 45"), "tok", {"42"})
+        text = self._sent_reply(sent)
+        assert "Sold all 45 MC.PA" in text
+        document = self._load(holdings_file)
+        assert "MC.PA" not in document["holdings"]
+        assert document["holdings"]["IUSA.DE"] == 720
+
+    def test_remove_drops_the_position(self, sent, holdings_file, ok_ticker, quotes):
+        stock_bot.process_update(self._update(42, "/remove IUSA.DE"), "tok", {"42"})
+        text = self._sent_reply(sent)
+        assert "Removed 720 IUSA.DE" in text
+        document = self._load(holdings_file)
+        assert "IUSA.DE" not in document["holdings"]
+        assert document["holdings"]["MC.PA"]["qty"] == 45
+
+    def test_remove_of_an_absent_ticker_is_refused(
+        self, sent, holdings_file, ok_ticker, quotes
+    ):
+        stock_bot.process_update(self._update(42, "/remove NOPE"), "tok", {"42"})
+        text = self._sent_reply(sent)
+        assert "not in the portfolio" in text
+        document = self._load(holdings_file)
+        assert set(document["holdings"]) == {"MC.PA", "IUSA.DE"}
+
+    def test_unknown_ticker_is_refused(self, sent, mocker, holdings_file, quotes):
+        mocker.patch(
+            "stock.resolve_symbol",
+            return_value={
+                "symbol": "APL",
+                "status": "unknown",
+                "name": None,
+                "price": None,
+                "currency": None,
+            },
+        )
+        stock_bot.process_update(self._update(42, "/buy APL 5 100"), "tok", {"42"})
+        text = self._sent_reply(sent)
+        assert "does not resolve" in text
+        document = self._load(holdings_file)
+        assert "APL" not in document["holdings"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "/buy",
+            "/buy MC.PA",
+            "/buy MC.PA abc",
+            "/buy MC.PA 5 0",
+            "/sell MC.PA",
+            "/sell MC.PA 0",
+            "/remove",
+        ],
+    )
+    def test_bad_arguments_get_the_usage_and_write_nothing(
+        self, sent, holdings_file, text
+    ):
+        stock_bot.process_update(self._update(42, text), "tok", {"42"})
+        reply = self._sent_reply(sent)
+        assert "/buy" in reply and "QUANTITY" in reply
+        document = self._load(holdings_file)
+        assert set(document["holdings"]) == {"MC.PA", "IUSA.DE"}
+
+    def test_overselling_is_refused(self, sent, holdings_file, ok_ticker, quotes):
+        stock_bot.process_update(self._update(42, "/sell MC.PA 46"), "tok", {"42"})
+        text = self._sent_reply(sent)
+        assert "Could not record" in text
+        document = self._load(holdings_file)
+        assert document["holdings"]["MC.PA"]["qty"] == 45
+
+    def test_a_trade_clears_the_quote_cache(
+        self, sent, holdings_file, ok_ticker, quotes
+    ):
+        # Pre-trade cached quotes must not leak into the reply: the stale
+        # entry is dropped, and whatever the cache holds after the reply was
+        # fetched from the updated file.
+        stock_bot._cache["summaries"] = (0.0, ("stale", {}, []))
+        stock_bot.process_update(self._update(42, "/buy MC.PA 5"), "tok", {"42"})
+        cached = stock_bot._cache.get("summaries")
+        assert cached is not None
+        assert cached[1][0]["MC.PA"]["qty"] == 50
+
+    def test_trade_commands_are_registered(self, sent):
+        stock_bot.set_my_commands("tok")
+        registered = {c["command"] for c in json.loads(sent[0][1]["commands"])}
+        assert {"buy", "sell", "remove"} <= registered
+
+    def test_stranger_cannot_trade(self, sent, holdings_file, ok_ticker, quotes):
+        assert (
+            stock_bot.process_update(self._update(999, "/buy MC.PA 5"), "tok", {"42"})
+            is False
+        )
+        assert "sendMessage" not in [m for m, _ in sent]
+        document = self._load(holdings_file)
+        assert document["holdings"]["MC.PA"] == {"qty": 45, "cost": 400}
