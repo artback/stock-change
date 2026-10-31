@@ -1,10 +1,11 @@
 """Telegram bot exposing the portfolio to a phone.
 
-Long-polls the Telegram Bot API and answers a handful of read-only commands
-and the inline menu buttons that ride along with every reply — the portfolio
+Long-polls the Telegram Bot API and answers a handful of read commands and
+the inline menu buttons that ride along with every reply — the portfolio
 can be read by tapping, not typing. It also registers itself in the chat
-header (command list and menu button), like other bots. It reports; it
-never edits holdings and never places trades.
+header (command list and menu button), like other bots. /buy, /sell and
+/remove record the holdings changes the user tells it about — bookkeeping
+on the config file; the bot never places a trade.
 
 Only chat IDs listed in ``TELEGRAM_ALLOWED_CHAT_IDS`` are answered — without
 that, anyone who finds the bot could read the portfolio. With the allowlist
@@ -77,9 +78,13 @@ HELP = """<b>Portfolio bot</b>
 /dividends - upcoming payouts and 12m income
 /allocation - position weights and currency exposure
 /news - recent headlines
+/buy &lt;TICKER&gt; &lt;QTY&gt; [COST] - record a purchase
+/sell &lt;TICKER&gt; &lt;QTY&gt; - record a sale
+/remove &lt;TICKER&gt; - remove a position
 /help - this message
 
-Read-only: this bot cannot change holdings or place trades."""
+The trade commands only update the recorded holdings — the bot never
+places a trade."""
 
 # /start greets with a short welcome that points at the menu buttons; /help
 # keeps the full command list.
@@ -87,7 +92,8 @@ WELCOME = """<b>Portfolio bot</b>
 
 Tap a button, or send /portfolio — every reply carries the menu.
 
-/help lists all the commands. Read-only: it reports, and never trades."""
+/help lists all the commands, including /buy, /sell and /remove for
+recording holdings. It never places a trade."""
 
 # The reply for a failed section; the text and button paths must word it
 # identically, so it lives in one place.
@@ -594,6 +600,135 @@ def cmd_news(limit=5):
     return "\n\n".join(blocks)
 
 
+def _parse_amount(raw):
+    """A share count or a price: a positive number, else None."""
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _fmt_qty(value):
+    """Share counts without a trailing .0: 5, not 5.0."""
+    return f"{value:g}"
+
+
+_TRADE_USAGE = """<b>Record holdings</b>
+
+/buy &lt;TICKER&gt; &lt;QUANTITY&gt; [COST] — bought more, or a new position
+/sell &lt;TICKER&gt; &lt;QUANTITY&gt; — sold some
+/remove &lt;TICKER&gt; — sold out of a position
+
+QUANTITY and COST are positive numbers. COST is the price paid per share on
+this purchase, in the ticker's own currency, blended into the average cost.
+These commands only update the recorded holdings — the bot never places a
+trade."""
+
+
+def _unknown_ticker_reply(ticker):
+    return (
+        f"⚠️ {html.escape(ticker)} does not resolve to a known ticker. Non-US "
+        "listings need their exchange suffix — e.g. MC.PA, SVOL-B.ST."
+    )
+
+
+def _unverified_note(instrument):
+    if instrument["status"] != "unverified":
+        return ""
+    return (
+        "\n\n⚠️ The price service was unreachable, so the ticker was "
+        "recorded unchecked — confirm it appears correctly."
+    )
+
+
+def _reply_after_trade(note, width):
+    """A recorded change plus the updated portfolio, fresh from the file.
+
+    The quote cache is cleared first: its entries were built from the
+    holdings last fetched, and those just changed.
+    """
+    log.info("holdings updated: %s", note.split("\n", 1)[0])
+    _cache.clear()
+    return note + "\n\n" + cmd_portfolio(width)
+
+
+def _cmd_buy(args, width):
+    if len(args) not in (2, 3):
+        return _TRADE_USAGE
+    ticker = args[0]
+    qty = _parse_amount(args[1])
+    cost_raw = args[2] if len(args) == 3 else None
+    cost = _parse_amount(cost_raw) if cost_raw is not None else None
+    if qty is None or (cost_raw is not None and cost is None):
+        return _TRADE_USAGE
+
+    instrument = stock.resolve_symbol(ticker)
+    if instrument["status"] == "unknown":
+        return _unknown_ticker_reply(ticker)
+    try:
+        result = stock.add_shares(instrument["symbol"], qty, cost=cost)
+    except ValueError as exc:
+        return f"⚠️ Could not record that: {html.escape(str(exc))}"
+
+    line = f"✅ Bought {_fmt_qty(abs(result['delta']))} {result['symbol']}"
+    if cost is not None:
+        line += f" @ {_fmt_qty(cost)}"
+    line += f" — now holding {_fmt_qty(result['quantity'])}"
+    if result["previous_quantity"]:
+        line += f" (was {_fmt_qty(result['previous_quantity'])})"
+    return _reply_after_trade(line + _unverified_note(instrument), width)
+
+
+def _cmd_sell(args, width):
+    if len(args) != 2:
+        return _TRADE_USAGE
+    ticker = args[0]
+    qty = _parse_amount(args[1])
+    if qty is None:
+        return _TRADE_USAGE
+
+    instrument = stock.resolve_symbol(ticker)
+    if instrument["status"] == "unknown":
+        return _unknown_ticker_reply(ticker)
+    try:
+        result = stock.add_shares(instrument["symbol"], -qty)
+    except ValueError as exc:
+        return f"⚠️ Could not record that: {html.escape(str(exc))}"
+
+    if result["action"] == "removed":
+        line = (
+            f"📉 Sold all {_fmt_qty(result['previous_quantity'])} "
+            f"{result['symbol']} — position closed."
+        )
+    else:
+        line = (
+            f"📉 Sold {_fmt_qty(abs(result['delta']))} {result['symbol']}"
+            f" — now holding {_fmt_qty(result['quantity'])}"
+            f" (was {_fmt_qty(result['previous_quantity'])})"
+        )
+    return _reply_after_trade(line + _unverified_note(instrument), width)
+
+
+def _cmd_remove(args, width):
+    if len(args) != 1:
+        return _TRADE_USAGE
+    ticker = args[0]
+
+    instrument = stock.resolve_symbol(ticker)
+    if instrument["status"] == "unknown":
+        return _unknown_ticker_reply(ticker)
+    try:
+        result = stock.remove_holding(instrument["symbol"])
+    except KeyError:
+        return (
+            f"⚠️ {html.escape(ticker)} is not in the portfolio — "
+            "/portfolio lists the current holdings."
+        )
+    line = f"🗑 Removed {_fmt_qty(result['previous_quantity'])} {result['symbol']}."
+    return _reply_after_trade(line + _unverified_note(instrument), width)
+
+
 def handle_command(text, width=DEFAULT_WIDTH):
     """Map one incoming message to a reply."""
     parts = text.strip().split()
@@ -617,6 +752,12 @@ def handle_command(text, width=DEFAULT_WIDTH):
         return cmd_allocation(width)
     if command in ("/news", "/n"):
         return cmd_news()
+    if command == "/buy":
+        return _cmd_buy(args, width)
+    if command == "/sell":
+        return _cmd_sell(args, width)
+    if command == "/remove":
+        return _cmd_remove(args, width)
     return None
 
 
@@ -756,6 +897,9 @@ def set_my_commands(token):
             "description": "Position weights and currency exposure",
         },
         {"command": "news", "description": "Recent headlines"},
+        {"command": "buy", "description": "Record a purchase: TICKER QUANTITY [COST]"},
+        {"command": "sell", "description": "Record a sale: TICKER QUANTITY"},
+        {"command": "remove", "description": "Remove a position: TICKER"},
         {"command": "help", "description": "This command list"},
     ]
     _request(token, "setMyCommands", {"commands": json.dumps(commands)}, timeout=20)

@@ -266,8 +266,9 @@ during an outage, flagged as stale.
 
 ## Telegram bot
 
-Check the portfolio from your phone. The bot is read-only — it reports, and
-cannot edit holdings or place trades.
+Check the portfolio from your phone. The bot reports, and records the
+holdings changes you tell it about (`/buy`, `/sell`, `/remove`) — it updates
+the holdings file, never places a trade.
 
 ```bash
 pip install stock-price          # no extra dependencies needed
@@ -282,6 +283,14 @@ stock-price-bot
 | `/dividends`, `/d` | Upcoming payouts and 12-month income |
 | `/allocation`, `/a` | Position weights and currency exposure |
 | `/news`, `/n` | Recent headlines |
+| `/buy <TICKER> <QTY> [COST]` | Record a purchase (or a new position); COST is the per-share price paid, blended into the average cost |
+| `/sell <TICKER> <QTY>` | Record a sale; selling down to zero removes the position |
+| `/remove <TICKER>` | Remove a position |
+
+A recorded change replies with a confirmation plus the updated portfolio, so
+the new position is visible in place. Tickers are checked against the price
+service first: a typo'd ticker is refused, an unreachable one is recorded
+with an "unchecked" note.
 
 ### Menu buttons
 
@@ -292,9 +301,9 @@ opens a picker with one button per configured ticker (capped at 20); tapping
 a ticker shows that position in detail. All the commands above keep working
 as before.
 
-The menu is **sticky**: pressing a button edits the menu message in place
-instead of stacking a new message — re-pressing the section already on
-screen does nothing. The bot also installs itself in the chat header like
+Pressing a button clears the previous menu message and creates a fresh one in
+its place, so the menu reads as an in-place update instead of stacking a
+message per tap. The bot also installs itself in the chat header like
 other bots: its menu button there opens the command dropdown (registered via
 `setMyCommands` / `setChatMenuButton`), so the same sections can be reached
 from the bar without touching a message.
@@ -310,8 +319,11 @@ the only thing keeping your portfolio private: unknown chats get silence.
 
 A ready-to-run Nomad job for a home cluster is in
 [`deploy/nomad/stock-bot.nomad.hcl`](deploy/nomad/stock-bot.nomad.hcl). It keeps
-the token in a Nomad Variable rather than the jobspec, and mounts a volume so
-the recorded portfolio history survives restarts.
+the token in a Nomad Variable rather than the jobspec, and mounts a Docker
+named volume so the recorded holdings, the portfolio history and the price
+cache survive deploys. The rendered config is a first-boot seed: `start.sh`
+copies it into the volume only if the live file is missing, after which the
+volume is authoritative.
 
 Tickers that fail to load (network/rate-limit errors or invalid symbols) are
 retried with backoff and, if still unavailable, shown as a stale `⚠` / `error`

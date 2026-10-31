@@ -13,8 +13,8 @@
 #
 #   nomad job run deploy/nomad/stock-bot.nomad.hcl
 #
-# The bot is read-only: it reports the portfolio and cannot edit holdings or
-# place trades.
+# The bot reports the portfolio and records holdings changes (/buy, /sell,
+# /remove); it never places a trade.
 
 job "stock-bot" {
   datacenters = ["kalmar"]
@@ -41,6 +41,9 @@ job "stock-bot" {
         command = "/bin/sh"
         args    = ["-c", "/local/start.sh"]
 
+        # Named Docker volume — NOT the `volumes = ["name:path"]` shorthand:
+        # Nomad treats a relative source there as a path inside the alloc dir,
+        # which is deleted on GC.
         mounts = [{
           type     = "volume"
           source   = "stock-bot-data"
@@ -50,11 +53,13 @@ job "stock-bot" {
       }
 
       env {
-        # Portfolio history and the price cache live under $HOME, so pointing
-        # it at the volume is what lets "30D PORTFOLIO" accumulate across
-        # restarts instead of resetting every deploy.
+        # /data is the named volume above: the holdings file, the portfolio
+        # history and the price cache all live there (history and cache under
+        # $HOME), so they survive deploys. start.sh seeds stock.yaml from the
+        # rendered file on first boot only — after that this file is
+        # authoritative.
         HOME               = "/data"
-        STOCK_PRICE_CONFIG = "/local/stock.yaml"
+        STOCK_PRICE_CONFIG = "/data/stock.yaml"
         PIP_ROOT_USER_ACTION = "ignore"
       }
 
@@ -76,7 +81,9 @@ job "stock-bot" {
       }
 
       # Holdings are personal data; keeping them in a template rather than the
-      # image means they are changed with a job update, not a rebuild.
+      # image means they are changed with a job update, not a rebuild. From
+      # v0.13.0 this file is a first-boot seed: start.sh copies it to
+      # /data/stock.yaml only if the live file is missing.
       template {
         destination = "local/stock.yaml"
         change_mode = "restart"
@@ -101,12 +108,18 @@ job "stock-bot" {
         data        = <<-EOT
           #!/bin/sh
           set -eu
+          # Seed the persistent holdings file on first boot. /data is a
+          # Docker named volume: empty on first mount, authoritative from
+          # then on.
+          if [ ! -f /data/stock.yaml ]; then
+            cp /local/stock.yaml /data/stock.yaml
+          fi
           # Installed from the release tarball rather than git+https: the slim
           # image has no git, and a tarball avoids installing one just to fetch
           # a few files. Pinned to a tag so an unattended restart can't pull an
           # untested main.
           pip install --no-cache-dir --quiet \
-            "https://github.com/artback/stock-change/archive/refs/tags/v0.12.1.tar.gz"
+            "https://github.com/artback/stock-change/archive/refs/tags/v0.13.0.tar.gz"
           exec stock-price-bot
         EOT
       }
