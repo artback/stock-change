@@ -7,10 +7,12 @@ which every API call passes, so patching it covers the whole surface.
 import html
 import json
 import re
+import threading
 import time
 
 import pytest
 
+import stock
 import stock_bot
 
 
@@ -308,10 +310,11 @@ class TestMenuButtons:
     """The inline menu makes the bot tappable instead of typed.
 
     Button presses arrive as callback_query updates. They must be routed to
-    the same cmd_* functions as slash commands, answered in place (an
-    editMessageText that falls back to a fresh sendMessage when the edit
-    fails), and acknowledged so the button's spinner stops. Strangers and
-    setup mode get only the ack — never the portfolio.
+    the same cmd_* functions as slash commands, answered by clearing the
+    pressed menu message and creating a fresh one in its place (so a tap
+    reads as an in-place update instead of stacking messages), and
+    acknowledged so the button's spinner stops. Strangers and setup mode get
+    only the ack — never the portfolio.
     """
 
     MENU_DATA = frozenset({"portfolio", "holding", "dividends", "allocation", "news"})
@@ -354,9 +357,9 @@ class TestMenuButtons:
                 assert set(button) == {"text", "callback_data"}, button
                 assert button["text"] and button["callback_data"]
 
-    def _edit(self, sent):
-        """The editMessageText call, or fail if the reply was not in place."""
-        return next(c for c in sent if c[0] == "editMessageText")
+    def _new_message(self, sent):
+        """The fresh reply message, or fail if no new message was created."""
+        return next(c for c in sent if c[0] == "sendMessage")
 
     def _ack(self, sent):
         """Every handled or ignored callback must stop the button's spinner."""
@@ -417,16 +420,22 @@ class TestMenuButtons:
         assert self._callback_data(markup) >= self.MENU_DATA
         self._valid_markup(markup)
 
-    def test_portfolio_callback_edits_the_menu_in_place(self, sent, portfolio):
+    def test_portfolio_callback_clears_the_old_and_sends_a_fresh_one(
+        self, sent, portfolio
+    ):
         assert stock_bot.process_update(self._callback(), "tok", {"42"}) is True
-        edit = self._edit(sent)
-        assert edit[1]["chat_id"] in (42, "42")
-        assert edit[1]["message_id"] == 7
-        assert "MC.PA" in edit[1]["text"]
-        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA
-        # The reply must land before the spinner is stopped.
-        assert sent.index(edit) < next(
-            i for i, (m, _) in enumerate(sent) if m == "answerCallbackQuery"
+        delete = next(c for c in sent if c[0] == "deleteMessage")
+        assert delete[1]["chat_id"] in (42, "42")
+        assert delete[1]["message_id"] == 7
+        send = self._new_message(sent)
+        assert "MC.PA" in send[1]["text"]
+        assert self._callback_data(send[1].get("reply_markup")) == self.MENU_DATA
+        # The old message is cleared before the fresh one lands, and the
+        # reply lands before the spinner is stopped.
+        assert (
+            sent.index(delete)
+            < sent.index(send)
+            < next(i for i, (m, _) in enumerate(sent) if m == "answerCallbackQuery")
         )
         self._ack(sent)
 
@@ -435,8 +444,8 @@ class TestMenuButtons:
             stock_bot.process_update(self._callback(data="holding"), "tok", {"42"})
             is True
         )
-        edit = self._edit(sent)
-        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA | {
+        send = self._new_message(sent)
+        assert self._callback_data(send[1].get("reply_markup")) == self.MENU_DATA | {
             "holding:MC.PA",
             "holding:IUSA.DE",
         }
@@ -449,11 +458,11 @@ class TestMenuButtons:
             )
             is True
         )
-        edit = self._edit(sent)
-        # The detail view is cmd_holding output, served in place.
-        assert "21,382" in edit[1]["text"]
-        assert "+18.79%" in edit[1]["text"]
-        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA
+        send = self._new_message(sent)
+        # The detail view is cmd_holding output, served in a fresh message.
+        assert "21,382" in send[1]["text"]
+        assert "+18.79%" in send[1]["text"]
+        assert self._callback_data(send[1].get("reply_markup")) == self.MENU_DATA
         self._ack(sent)
 
     def test_holding_unknown_ticker_lists_the_portfolio(self, sent, portfolio):
@@ -461,9 +470,9 @@ class TestMenuButtons:
             stock_bot.process_update(self._callback(data="holding:NOPE"), "tok", {"42"})
             is True
         )
-        edit = self._edit(sent)
-        assert "not in the portfolio" in edit[1]["text"]
-        assert "MC.PA" in edit[1]["text"]
+        send = self._new_message(sent)
+        assert "not in the portfolio" in send[1]["text"]
+        assert "MC.PA" in send[1]["text"]
         self._ack(sent)
 
     @pytest.mark.parametrize(
@@ -478,67 +487,41 @@ class TestMenuButtons:
         assert (
             stock_bot.process_update(self._callback(data=data), "tok", {"42"}) is True
         )
-        edit = self._edit(sent)
-        assert content in edit[1]["text"]
-        assert self._callback_data(edit[1].get("reply_markup")) == self.MENU_DATA
+        send = self._new_message(sent)
+        assert content in send[1]["text"]
+        assert self._callback_data(send[1].get("reply_markup")) == self.MENU_DATA
         self._ack(sent)
 
     def test_failing_section_replies_and_still_acks(self, sent, mocker, portfolio):
         # A section failure must not crash the poll loop.
         mocker.patch("stock_bot.cmd_portfolio", side_effect=RuntimeError("boom"))
         stock_bot.process_update(self._callback(), "tok", {"42"})
-        reply = next(c for c in sent if c[0] in ("editMessageText", "sendMessage"))
+        reply = next(c for c in sent if c[0] == "sendMessage")
         assert "went wrong" in reply[1]["text"]
         assert self._callback_data(reply[1].get("reply_markup")) == self.MENU_DATA
         self._ack(sent)
 
-    def test_edit_failure_falls_back_to_a_new_message(self, mocker, portfolio):
-        # The pressed menu message may have scrolled away or expired; the tap
-        # must still produce a reply.
+    def test_delete_failure_still_sends_the_reply(self, mocker, portfolio):
+        # The pressed menu message may already be gone (deleted by the user,
+        # or too old to delete); the tap must still produce a reply.
         calls = []
 
         def fake(token, method, params=None, timeout=None):
             calls.append((method, params or {}))
-            if method == "editMessageText":
-                raise RuntimeError("message to edit not found")
+            if method == "deleteMessage":
+                raise RuntimeError("message to delete not found")
             return []
 
         mocker.patch("stock_bot._request", side_effect=fake)
         assert stock_bot.process_update(self._callback(), "tok", {"42"}) is True
-        edit = next(c for c in calls if c[0] == "editMessageText")
+        delete = next(c for c in calls if c[0] == "deleteMessage")
         send = next(c for c in calls if c[0] == "sendMessage")
-        # The fallback carries the same reply, not a refetch or a bare apology.
+        # The reply carries the section, not a refetch or a bare apology.
         assert "MC.PA" in send[1]["text"]
-        assert send[1]["text"] == edit[1]["text"]
         assert send[1]["chat_id"] in (42, "42")
         assert self._callback_data(send[1].get("reply_markup")) == self.MENU_DATA
+        assert delete[1]["message_id"] == 7
         self._ack(calls)
-
-    def test_repressing_the_shown_section_sends_no_duplicate(self, mocker, portfolio):
-        # Telegram rejects an edit that changes nothing ("message is not
-        # modified"). Re-tapping the section the sticky menu already shows
-        # must not stack a duplicate message — the reply is on screen, so
-        # only the ack may follow.
-        calls = []
-
-        def fake(token, method, params=None, timeout=None):
-            calls.append((method, params or {}))
-            if method == "editMessageText":
-                raise RuntimeError(
-                    "editMessageText failed: Bad Request: message is not "
-                    "modified: specified new message content and reply "
-                    "markup are exactly the same as a current content and "
-                    "reply markup of the message"
-                )
-            return []
-
-        mocker.patch("stock_bot._request", side_effect=fake)
-        assert stock_bot.process_update(self._callback(), "tok", {"42"}) is True
-        methods = [m for m, _ in calls]
-        assert methods.count("editMessageText") == 1
-        assert "sendMessage" not in methods
-        # The press is still acknowledged so the button's spinner stops.
-        assert methods.count("answerCallbackQuery") == 1
 
     def test_stranger_callback_gets_only_an_ack(self, sent, portfolio):
         # In a group chat the buttons are visible to every member; the silence
@@ -549,7 +532,7 @@ class TestMenuButtons:
         )
         methods = [m for m, _ in sent]
         assert "sendMessage" not in methods
-        assert "editMessageText" not in methods
+        assert "deleteMessage" not in methods
         assert methods.count("answerCallbackQuery") == 1
         assert not any("MC.PA" in str(params) for _, params in sent)
 
@@ -557,7 +540,7 @@ class TestMenuButtons:
         assert stock_bot.process_update(self._callback(), "tok", set()) is False
         methods = [m for m, _ in sent]
         assert "sendMessage" not in methods
-        assert "editMessageText" not in methods
+        assert "deleteMessage" not in methods
         assert "answerCallbackQuery" in methods
         assert not any("MC.PA" in str(params) for _, params in sent)
 
@@ -945,6 +928,40 @@ class TestBackgroundRefresh:
         mocker.patch("stock.fetch_summaries", side_effect=RuntimeError("down"))
         stock_bot._refresh()
         assert "summaries" not in stock_bot._cache
+
+
+class TestRefresherStartup:
+    """The refresher starts only when a real portfolio exists to keep warm."""
+
+    @staticmethod
+    def _stop_after_first_poll(mocker):
+        def fake(token, method, params=None, timeout=None):
+            if method == "getUpdates":
+                raise KeyboardInterrupt
+            return []
+
+        mocker.patch("stock_bot._request", side_effect=fake)
+
+    def _refresher_threads(self):
+        return [t for t in threading.enumerate() if t.name == "quote-refresher"]
+
+    def test_missing_config_starts_no_refresher(self, monkeypatch, mocker):
+        # No config file means the built-in demo holdings; the background
+        # refresher must not fetch those.
+        monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
+        self._stop_after_first_poll(mocker)
+        stock_bot.main()
+        assert not self._refresher_threads()
+
+    def test_configured_bot_starts_the_refresher(self, monkeypatch, mocker):
+        monkeypatch.setenv("TELEGRAM_TOKEN", "tok")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
+        stock.DEFAULT_CONFIG_PATH.write_text("holdings:\n  MC.PA: 1\n")
+        mocker.patch("stock.fetch_summaries", return_value=({}, {}, []))
+        self._stop_after_first_poll(mocker)
+        stock_bot.main()
+        assert self._refresher_threads()
 
 
 class TestTickerLinks:
